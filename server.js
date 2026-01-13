@@ -20,7 +20,7 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 3001;
 
 // ================= PROXY CONFIG (UNCHANGED) =================
-const PROXY_URL = process.env.PROXY_URL || null;
+const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
 const FREE_PROXIES = [
   // Add working ones from https://free-proxy-list.net/ (look for HTTPS, Elite, EU)
@@ -578,7 +578,7 @@ async function enrichFromDetail(br, item) {
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
   try {
-    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
+    await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.pageTimeout });
     await acceptCookies(page);
     await simulateHumanBehavior(page);
 
@@ -735,6 +735,42 @@ app.post("/api/scrape", async (req, res) => {
 app.post("/api/cache/clear", (req, res) => {
   cache.clear();
   res.json({ ok: true });
+});
+
+// ================= DEBUG: PING CHRONO24 =================
+app.get("/api/ping-chrono24", async (req, res) => {
+  let br;
+  let context;
+
+  try {
+    br = await getBrowser(true); // force nouveau browser
+    const pageObj = await createPage(br, false);
+    context = pageObj.context;
+    const page = pageObj.page;
+
+    const resp = await page.goto("https://www.chrono24.fr", {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+
+    const title = await page.title().catch(() => "");
+    const status = resp ? resp.status() : null;
+
+    res.json({
+      ok: true,
+      status,
+      title,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: String(e.message || e),
+      timestamp: new Date().toISOString(),
+    });
+  } finally {
+    if (context) await context.close().catch(() => {});
+  }
 });
 
 // ================= STARTUP =================
