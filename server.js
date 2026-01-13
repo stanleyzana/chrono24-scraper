@@ -1,13 +1,31 @@
 /**
- * Chrono24 Scraper (Render + Lovable friendly) — UPDATED
- * ✅ Proxy config kept (PROXY_URL + FREE_PROXIES), safe-trimmed
- * ✅ Page scraping: waitUntil:"commit", waitForSelector state:"attached"
- * ✅ Link-first strict in MAIN + fallback global filtered in-main
- * ✅ Pagination supported (page + pageSize)
- * ✅ PARTIAL MODE: if maxPages < totalPages => returns 200 with partial:true (NO fail-fast)
- * ✅ Fail-fast exact ONLY when scrape is complete (pagesScraped === totalPages)
- * ✅ detailMode: "none" (default) | "missing" (enrich detail only for missing prices)
- * ✅ Debug endpoints: /health, /api/ping-chrono24, /api/debug-goto
+ * Chrono24 Scraper — PRÊT À COLLER (prix récupérés via pages détail)
+ *
+ * ✅ Scrape les pages liste (page/pageSize) pour récupérer IDs + URLs
+ * ✅ Récupère les PRIX en ouvrant les pages DÉTAIL (meta[itemprop=price] ou JSON-LD)
+ * ✅ Évite les timeouts Lovable : budget temps + timeout détail + limite de lookups
+ * ✅ Pas de fail-fast quand tu ne scrapes pas toutes les pages (partial:true)
+ *
+ * Body POST /api/scrape (exemples) :
+ * 1) Rapide (liste + enrich prix limité)
+ * {
+ *   "url": "https://www.chrono24.fr/patekphilippe/ref-5738r001.htm",
+ *   "pageSize": 30,
+ *   "maxPages": 1,
+ *   "enrichPrices": true,
+ *   "maxDetailLookups": 30,
+ *   "detailTimeBudgetMs": 150000,
+ *   "noCache": true
+ * }
+ *
+ * 2) Liste seulement (aucun détail)
+ * {
+ *   "url": "...",
+ *   "pageSize": 30,
+ *   "maxPages": 1,
+ *   "enrichPrices": false,
+ *   "noCache": true
+ * }
  */
 
 const express = require("express");
@@ -20,7 +38,7 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3001;
 
-// ================= PROXY CONFIG (kept) =================
+// ================= PROXY CONFIG (kept, safe-trim) =================
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
 const FREE_PROXIES = [
@@ -49,27 +67,35 @@ const CONFIG = {
   ],
   acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 
-  detailConcurrency: 3,
+  // list
   pageTimeout: 90000,
   selectorTimeout: 60000,
+
+  // detail
+  detailConcurrency: 3,
+  detailGotoTimeoutMs: 20000,
   detailRetryCount: 1,
 };
 
 // ================= UTILS =================
-function randomDelay(min = 500, max = 2000) {
+function randomDelay(min = 250, max = 700) {
   return Math.floor(Math.random() * (max - min) + min);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function getRandomUserAgent() {
   return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 }
+
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
+
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
+
 function parseEuroFromText(s) {
   const t = normalize(s);
   const patterns = [
@@ -86,6 +112,7 @@ function parseEuroFromText(s) {
   }
   return null;
 }
+
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
@@ -96,15 +123,12 @@ function withParams(inputUrl, params) {
 function createLimiter(concurrency) {
   let active = 0;
   const queue = [];
-
   const runNext = () => {
     if (active >= concurrency) return;
     const job = queue.shift();
     if (!job) return;
-
     active++;
     const { fn, resolve, reject } = job;
-
     Promise.resolve()
       .then(fn)
       .then(resolve, reject)
@@ -113,7 +137,6 @@ function createLimiter(concurrency) {
         runNext();
       });
   };
-
   return (fn) =>
     new Promise((resolve, reject) => {
       queue.push({ fn, resolve, reject });
@@ -145,13 +168,11 @@ async function getBrowser(forceNew = false) {
   const proxy = getNextProxy();
 
   if (browserInstance && forceNew) {
-    console.log("[Browser] forceNew=true, closing existing browser");
     await browserInstance.close().catch(() => {});
     browserInstance = null;
   }
 
   if (browserInstance && proxy !== currentBrowserProxy) {
-    console.log("[Browser] Proxy changed, closing old browser");
     await browserInstance.close().catch(() => {});
     browserInstance = null;
   }
@@ -218,6 +239,7 @@ async function createPage(br, stealth = true) {
     });
   }
 
+  // block heavy resources
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -240,13 +262,13 @@ async function acceptCookies(page) {
     'button:has-text("Accept All")',
     'button:has-text("Accept")',
   ];
-  await page.waitForTimeout(randomDelay(500, 1500));
+  await page.waitForTimeout(randomDelay(350, 800));
   for (const s of sels) {
     try {
       const b = await page.$(s);
       if (b) {
         await b.click().catch(() => {});
-        await page.waitForTimeout(randomDelay(300, 800));
+        await page.waitForTimeout(randomDelay(200, 500));
         return;
       }
     } catch {}
@@ -255,7 +277,7 @@ async function acceptCookies(page) {
 
 async function simulateHumanBehavior(page) {
   await page.evaluate(() => window.scrollTo(0, Math.random() * 500));
-  await page.waitForTimeout(randomDelay(200, 600));
+  await page.waitForTimeout(randomDelay(150, 450));
   await page.mouse.move(Math.random() * 800 + 100, Math.random() * 400 + 100);
 }
 
@@ -310,6 +332,7 @@ async function extractSponsored(card) {
   }
 }
 async function extractPriceFromCard(card) {
+  // Try to get price from list if possible
   try {
     const meta = await card.$('meta[itemprop="price"]');
     if (meta) {
@@ -343,15 +366,15 @@ async function extractPriceFromCard(card) {
   return { price: null, priceSource: "missing" };
 }
 
-// ================= DETAIL ENRICH (optional) =================
-async function enrichFromDetail(br, item) {
+// ================= DETAIL PRICE EXTRACTION (core fix) =================
+async function fetchPriceFromDetail(br, item) {
   const attempt = async () => {
-    const { context, page } = await createPage(br);
+    const { context, page } = await createPage(br, false);
     try {
-      await page.goto(item.url, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
+      await page.goto(item.url, { waitUntil: "commit", timeout: CONFIG.detailGotoTimeoutMs });
       await acceptCookies(page);
-      await simulateHumanBehavior(page);
 
+      // meta[itemprop=price]
       const meta = await page.$('meta[itemprop="price"]');
       if (meta) {
         const c = await meta.getAttribute("content");
@@ -365,6 +388,7 @@ async function enrichFromDetail(br, item) {
         }
       }
 
+      // JSON-LD offers.price
       const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
         nodes.map((n) => n.textContent).filter(Boolean)
       );
@@ -403,6 +427,7 @@ async function enrichFromDetail(br, item) {
         item.price = null;
         item.priceSource = "on-request";
       } else {
+        item.price = null;
         item.priceSource = "detail-missing";
       }
       return false;
@@ -416,7 +441,7 @@ async function enrichFromDetail(br, item) {
   } catch (e) {
     const msg = String(e?.message || e);
     if (/Timeout/i.test(msg) && CONFIG.detailRetryCount > 0) {
-      await sleep(500);
+      await sleep(300);
       try {
         return await attempt();
       } catch {
@@ -470,7 +495,6 @@ async function scrapeOnePage(br, pageUrl) {
     if (selectorUsed === anySel && links.some((x) => x.inMain)) {
       filtered = links.filter((x) => x.inMain);
     }
-
     filtered = filtered.filter((x) => x.href.includes(".htm"));
 
     if (filtered.length === 0) {
@@ -490,7 +514,6 @@ async function scrapeOnePage(br, pageUrl) {
         const a = await page.$(`a[href="${href}"]`);
         if (a) cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
       } catch {}
-
       if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
 
       byId.set(id, { id, url: fullUrl, card: cardHandle });
@@ -521,14 +544,17 @@ async function scrapeOnePage(br, pageUrl) {
   }
 }
 
-// ================= MAIN SCRAPER (partial-safe) =================
+// ================= MAIN SCRAPER =================
 async function scrapeChrono24(url, opts) {
   const pageSize = Number(opts.pageSize || 120);
   const maxPages = Number(opts.maxPages || 50);
   const noCache = !!opts.noCache;
-  const detailMode = String(opts.detailMode || "none"); // "none" | "missing"
 
-  const cacheKey = JSON.stringify({ url, pageSize, maxPages, detailMode });
+  const enrichPrices = opts.enrichPrices !== undefined ? !!opts.enrichPrices : true;
+  const maxDetailLookups = Number(opts.maxDetailLookups || pageSize);
+  const detailTimeBudgetMs = Number(opts.detailTimeBudgetMs || 150000);
+
+  const cacheKey = JSON.stringify({ url, pageSize, maxPages, enrichPrices, maxDetailLookups, detailTimeBudgetMs });
   const cached = getCached(cacheKey, noCache);
   if (cached) return { ...cached, fromCache: true };
 
@@ -556,38 +582,36 @@ async function scrapeChrono24(url, opts) {
 
   const items = [...all.values()];
 
-  if (detailMode === "missing") {
+  // Price enrichment from detail pages (bounded)
+  let detailLookupsAttempted = 0;
+  let detailLookupsDone = 0;
+  const budgetStart = Date.now();
+
+  if (enrichPrices) {
     const missing = items.filter((it) => it.priceSource === "missing");
-    if (missing.length > 0) {
-      const limit = createLimiter(CONFIG.detailConcurrency);
-      await Promise.all(
-        missing.map((it) =>
-          limit(async () => {
-            await enrichFromDetail(br, it);
-            await sleep(randomDelay(400, 900));
-          })
-        )
-      );
-    }
+    const toEnrich = missing.slice(0, Math.max(0, maxDetailLookups));
+    const limit = createLimiter(CONFIG.detailConcurrency);
+
+    await Promise.all(
+      toEnrich.map((it) =>
+        limit(async () => {
+          if (Date.now() - budgetStart > detailTimeBudgetMs) {
+            it.priceSource = "skipped-budget";
+            return;
+          }
+          detailLookupsAttempted++;
+          const ok = await fetchPriceFromDetail(br, it);
+          if (ok) detailLookupsDone++;
+          await sleep(randomDelay(200, 600));
+        })
+      )
+    );
   }
 
   const isComplete = pagesScraped === computedTotalPages;
 
-  // Fail-fast ONLY if complete, else return partial
-  if (isComplete && typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
-    const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
-    e.meta = {
-      expectedCount,
-      got: items.length,
-      pagesScraped,
-      pageSize,
-      totalPages: computedTotalPages,
-      sample: items.slice(0, 5),
-    };
-    throw e;
-  }
-
   const result = {
+    scrapedAt: new Date().toISOString(),
     expectedCount,
     count: items.length,
     pageSize,
@@ -595,9 +619,15 @@ async function scrapeChrono24(url, opts) {
     totalPages: computedTotalPages,
     maxPages,
     partial: !isComplete,
-    detailMode,
-    items,
     warning: !isComplete ? `Partial scrape: scraped ${pagesScraped}/${computedTotalPages} pages` : null,
+
+    enrichPrices,
+    maxDetailLookups,
+    detailTimeBudgetMs,
+    detailLookupsAttempted,
+    detailLookupsDone,
+
+    items,
   };
 
   setCache(cacheKey, result);
@@ -619,11 +649,11 @@ app.post("/api/scrape", async (req, res) => {
   console.log("[BODY]", req.body);
 
   try {
-    const { url, pageSize, maxPages, noCache, detailMode } = req.body || {};
+    const { url } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
       return res.status(400).json({ error: "Invalid Chrono24 URL" });
     }
-    const out = await scrapeChrono24(url, { pageSize, maxPages, noCache, detailMode });
+    const out = await scrapeChrono24(url, req.body || {});
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message, meta: e.meta || null });
@@ -635,11 +665,9 @@ app.post("/api/cache/clear", (req, res) => {
   res.json({ ok: true });
 });
 
-// DEBUG: Ping chrono24 homepage
 app.get("/api/ping-chrono24", async (req, res) => {
   let br;
   let context;
-
   try {
     br = await getBrowser(true);
     const pageObj = await createPage(br, false);
@@ -658,7 +686,6 @@ app.get("/api/ping-chrono24", async (req, res) => {
   }
 });
 
-// DEBUG: Fetch any URL and return title + html head
 app.get("/api/debug-goto", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
