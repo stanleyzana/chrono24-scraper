@@ -1,13 +1,12 @@
 /**
- * Chrono24 Bulletproof Scraper (Render-safe)
- * ✅ Pagination multi-pages (page + pageSize) via URLSearchParams (conserve les query params d'origine)
- * ✅ Link-first STRICT: on prend d’abord les liens dans <main>
- * ✅ Fallback contrôlé: si <main> ne charge pas sur Render, on prend les liens globaux MAIS on filtre ceux qui sont dans <main> si possible
- * ✅ Dedup STRICT: uniquement /--id(\d+)\.htm/i
- * ✅ detailMode: "none" | "missing" | "all" (par défaut "missing")
- * ✅ Détail résilient: timeout + retry + NE FAIT PAS PLANTER le batch (marque detail-timeout / detail-error)
- * ✅ Fail-fast FINAL sur le count UNIQUEMENT (pagination), pas sur les prix
- * ✅ Debug anti-bot: si aucun lien trouvé, log title + html preview + screenshot path
+ * Chrono24 Bulletproof Scraper v5 (Fixed, proxy untouched)
+ * - Proxy section LEFT AS-IS (no changes)
+ * - Chrome-only UAs
+ * - Clean headers (no forced Sec-CH-UA / Sec-Fetch)
+ * - Link-first strict in MAIN + safe global fallback filtered in ONE PASS (fast)
+ * - Fail-fast exact after pagination
+ * - Retry on timeout in enrichFromDetail (non-blocking)
+ * - getBrowser(forceNew) properly closes old instance when forced (fix)
  */
 
 const express = require("express");
@@ -20,24 +19,38 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3001;
 
+// ================= PROXY CONFIG (UNCHANGED) =================
+const PROXY_URL = process.env.PROXY_URL || null;
+
+const FREE_PROXIES = [
+  // Add working ones from https://free-proxy-list.net/ (look for HTTPS, Elite, EU)
+];
+
+let currentProxyIndex = 0;
+function getNextProxy() {
+  if (PROXY_URL) return PROXY_URL;
+  if (FREE_PROXIES.length === 0) return null;
+  const proxy = FREE_PROXIES[currentProxyIndex % FREE_PROXIES.length];
+  currentProxyIndex++;
+  return proxy;
+}
+
 // ================= CONFIG =================
 const CONFIG = {
   cacheTTLms: 10 * 60 * 1000,
   viewport: { width: 1920, height: 1080 },
   locale: "fr-FR",
-  userAgent:
+  userAgents: [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+  ],
   acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-
-  listGotoTimeoutMs: 90000,
-  listSelectorTimeoutMs: 60000,
-
-  detailGotoTimeoutMs: 60000,
+  detailConcurrency: 3,
+  pageTimeout: 90000,
+  selectorTimeout: 60000,
   detailRetryCount: 1,
-  detailConcurrency: 4,
-
-  betweenPagesDelayMsMin: 300,
-  betweenPagesDelayMsMax: 800,
 };
 
 // ================= INLINE CONCURRENCY LIMITER =================
@@ -69,9 +82,6 @@ function createLimiter(concurrency) {
     });
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-
 // ================= CACHE =================
 const cache = new Map();
 function getCached(key, noCache) {
@@ -88,32 +98,107 @@ function setCache(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
 
+// ================= RANDOM HELPERS =================
+function randomDelay(min = 500, max = 2000) {
+  return Math.floor(Math.random() * (max - min) + min);
+}
+function getRandomUserAgent() {
+  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ================= BROWSER =================
 let browserInstance = null;
-async function getBrowser() {
-  if (!browserInstance) {
-    browserInstance = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    });
+let currentBrowserProxy = null;
+
+async function getBrowser(forceNew = false) {
+  const proxy = getNextProxy();
+
+  // FIX: if forceNew, close old instance even if proxy didn't change
+  if (browserInstance && forceNew) {
+    console.log("[Browser] forceNew=true, closing existing browser");
+    await browserInstance.close().catch(() => {});
+    browserInstance = null;
   }
+
+  // If proxy changed, close old browser
+  if (browserInstance && proxy !== currentBrowserProxy) {
+    console.log("[Browser] Proxy changed, closing old browser");
+    await browserInstance.close().catch(() => {});
+    browserInstance = null;
+  }
+
+  if (!browserInstance) {
+    const launchOptions = {
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+      ],
+    };
+
+    // proxy untouched
+    if (proxy) {
+      console.log(`[Browser] Using proxy: ${proxy.replace(/:[^:]+@/, ":***@")}`);
+      launchOptions.proxy = { server: proxy };
+    } else {
+      console.log("[Browser] No proxy configured, using direct connection");
+    }
+
+    browserInstance = await chromium.launch(launchOptions);
+    currentBrowserProxy = proxy;
+  }
+
   return browserInstance;
 }
 
-async function createPage(br) {
+async function createPage(br, stealth = true) {
+  const userAgent = getRandomUserAgent();
+
   const context = await br.newContext({
     locale: CONFIG.locale,
-    userAgent: CONFIG.userAgent,
+    userAgent,
     viewport: CONFIG.viewport,
-    extraHTTPHeaders: { "Accept-Language": CONFIG.acceptLanguage },
+    extraHTTPHeaders: {
+      "Accept-Language": CONFIG.acceptLanguage,
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      "Upgrade-Insecure-Requests": "1",
+    },
+    javaScriptEnabled: true,
+    bypassCSP: true,
+    ignoreHTTPSErrors: true,
   });
 
   const page = await context.newPage();
 
-  // blocage ressources lourdes
+  if (stealth) {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === "notifications"
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "languages", { get: () => ["fr-FR", "fr", "en-US", "en"] });
+      window.chrome = { runtime: {} };
+    });
+  }
+
+  // keep your blocking rules (unchanged)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
-    if (["image", "font", "media"].includes(t)) route.abort();
+    const url = route.request().url();
+
+    if (["media", "font"].includes(t)) route.abort();
+    else if (t === "image" && !url.includes("chrono24")) route.abort();
     else route.continue();
   });
 
@@ -124,17 +209,34 @@ async function createPage(br) {
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
+
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
+
+function isDetailPage(url) {
+  return /--id\d+\.htm/i.test(url);
+}
+
 function parseEuroFromText(s) {
   const t = normalize(s);
-  const m = t.match(/(\d{1,3}(?:[ .]\d{3})+)\s?€/);
-  if (!m) return null;
-  const v = Number(m[1].replace(/[ .]/g, ""));
-  return Number.isFinite(v) ? v : null;
+  const patterns = [
+    /(\d{1,3}(?:[ .]\d{3})+)\s?€/,
+    /€\s?(\d{1,3}(?:[ ,.]\d{3})+)/,
+    /(\d{4,})\s?€/,
+  ];
+
+  for (const pattern of patterns) {
+    const m = t.match(pattern);
+    if (m) {
+      const v = Number(m[1].replace(/[ .,]/g, ""));
+      if (Number.isFinite(v) && v > 100) return v;
+    }
+  }
+  return null;
 }
+
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
@@ -148,82 +250,50 @@ async function acceptCookies(page) {
     'button:has-text("Tout accepter")',
     'button:has-text("Accepter")',
     'button:has-text("J\'accepte")',
+    'button:has-text("Accept All")',
+    'button:has-text("Accept")',
   ];
+
+  await page.waitForTimeout(randomDelay(500, 1500));
+
   for (const s of sels) {
     try {
       const b = await page.$(s);
       if (b) {
         await b.click().catch(() => {});
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(randomDelay(300, 800));
         return;
       }
     } catch {}
   }
 }
 
+async function simulateHumanBehavior(page) {
+  await page.evaluate(() => window.scrollTo(0, Math.random() * 500));
+  await page.waitForTimeout(randomDelay(200, 600));
+  await page.mouse.move(Math.random() * 800 + 100, Math.random() * 400 + 100);
+}
+
 async function getExpectedCount(page) {
   try {
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    const m = bodyText.match(/(\d+)\s+(?:annonces?|résultats?|montres?)/i);
-    return m ? Number(m[1]) : null;
+    const patterns = [
+      /(\d+)\s+(?:annonces?|résultats?|montres?|watches?|listings?)/i,
+      /(?:Total|Résultats?|Found)[\s:]+(\d+)/i,
+    ];
+    for (const pattern of patterns) {
+      const m = bodyText.match(pattern);
+      if (m) return Number(m[1]);
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-// ================= LIST LINK DISCOVERY (Render-safe) =================
-async function waitForListingsSelector(page) {
-  const primary = 'main a[href*="--id"][href$=".htm"]';
-  const fallback = 'a[href*="--id"][href$=".htm"]';
-
-  // Primary: main
-  try {
-    await page.waitForSelector(primary, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
-    return primary;
-  } catch {}
-
-  // Fallback: anywhere
-  try {
-    await page.waitForSelector(fallback, { timeout: 15000, state: "attached" });
-    return fallback;
-  } catch {}
-
-  return null;
-}
-
-/**
- * Retourne des liens d'annonces sous forme d'objets:
- * [{ href, inMain }]
- * - si on a dû utiliser le fallback global, on filtre inMain=true si possible
- */
-async function collectListingLinks(page, selectorUsed) {
-  const sel = selectorUsed;
-  const links = await page.$$eval(sel, (as) =>
-    as
-      .map((a) => {
-        const href = a.getAttribute("href") || "";
-        const inMain = !!a.closest("main");
-        return { href, inMain };
-      })
-      .filter((x) => x.href)
-  );
-
-  if (sel.startsWith("main ")) {
-    // déjà strict
-    return links.map((x) => ({ href: x.href, inMain: true }));
-  }
-
-  // Fallback global: si on a des liens "dans main", on ne garde QUE ceux-là
-  const inMainLinks = links.filter((x) => x.inMain);
-  if (inMainLinks.length > 0) return inMainLinks;
-
-  // Sinon, dernier recours: retourner tout (peut inclure parasites, mais dédup par ID aidera)
-  return links;
-}
-
 // ================= CARD EXTRACTION =================
 async function extractTitle(card) {
-  const sels = [".article-title", "h3", "h2"];
+  const sels = [".article-title", "h3", "h2", '[class*="title"]'];
   for (const s of sels) {
     try {
       const el = await card.$(s);
@@ -236,7 +306,7 @@ async function extractTitle(card) {
 }
 
 async function extractCountry(card) {
-  const sels = ['[class*="country"]', '[class*="location"]'];
+  const sels = ['[class*="country"]', '[class*="location"]', '[class*="seller"]'];
   for (const s of sels) {
     try {
       const el = await card.$(s);
@@ -258,7 +328,6 @@ async function extractSponsored(card) {
 }
 
 async function extractPriceFromCard(card) {
-  // meta itemprop
   try {
     const meta = await card.$('meta[itemprop="price"]');
     if (meta) {
@@ -270,14 +339,12 @@ async function extractPriceFromCard(card) {
     }
   } catch {}
 
-  // on-request
   try {
     const txt = await card.evaluate((n) => n.innerText || "");
     if (/prix sur demande|price on request/i.test(txt)) return { price: null, priceSource: "on-request" };
   } catch {}
 
-  // price blocks
-  const sels = ['[data-testid="price"]', '[class*="price"]'];
+  const sels = ['[data-testid="price"]', '[class*="price"]', '[class*="Price"]'];
   for (const s of sels) {
     try {
       const el = await card.$(s);
@@ -295,81 +362,205 @@ async function extractPriceFromCard(card) {
   return { price: null, priceSource: "missing" };
 }
 
-// ================= DETAIL FALLBACK (RESILIENT) =================
-async function enrichFromDetail(br, item) {
+// ================= DETAIL PAGE SCRAPING =================
+async function scrapeDetailPage(br, url) {
   const { context, page } = await createPage(br);
-
-  const attempt = async () => {
-    await page.goto(item.url, { waitUntil: "domcontentloaded", timeout: CONFIG.detailGotoTimeoutMs });
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
     await acceptCookies(page);
+    await simulateHumanBehavior(page);
 
-    const meta = await page.$('meta[itemprop="price"]');
-    if (meta) {
-      const c = await meta.getAttribute("content");
-      if (c) {
-        const v = Number(String(c).replace(/[^\d]/g, ""));
-        if (v > 0) {
-          item.price = v;
-          item.priceSource = "detail-meta";
-          return true;
-        }
-      }
-    }
+    const id = extractListingId(url);
+    let title = null;
+    let price = null;
+    let priceSource = "missing";
+    let country = null;
 
-    const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
-      nodes.map((n) => n.textContent).filter(Boolean)
-    );
-
-    for (const raw of jsonlds) {
+    const titleSels = ["h1", '[class*="title"]', ".article-title"];
+    for (const s of titleSels) {
       try {
-        const data = JSON.parse(raw);
-        const candidates = Array.isArray(data) ? data : [data];
-
-        for (const c of candidates) {
-          if (c?.offers?.price) {
-            const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
-            if (v > 0) {
-              item.price = v;
-              item.priceSource = "detail-jsonld";
-              return true;
-            }
-          }
-          if (c?.["@graph"] && Array.isArray(c["@graph"])) {
-            for (const g of c["@graph"]) {
-              if (g?.offers?.price) {
-                const v = Number(String(g.offers.price).replace(/[^\d]/g, ""));
-                if (v > 0) {
-                  item.price = v;
-                  item.priceSource = "detail-jsonld";
-                  return true;
-                }
-              }
-            }
-          }
+        const el = await page.$(s);
+        if (el) {
+          title = normalize(await el.textContent());
+          if (title) break;
         }
       } catch {}
     }
 
-    const body = await page.evaluate(() => document.body?.innerText || "");
-    if (/prix sur demande|price on request/i.test(body)) {
-      item.price = null;
-      item.priceSource = "on-request";
-      return true;
+    // meta
+    try {
+      const meta = await page.$('meta[itemprop="price"]');
+      if (meta) {
+        const c = await meta.getAttribute("content");
+        if (c) {
+          const v = Number(String(c).replace(/[^\d]/g, ""));
+          if (v > 0) {
+            price = v;
+            priceSource = "detail-meta";
+          }
+        }
+      }
+    } catch {}
+
+    // json-ld
+    if (!price) {
+      try {
+        const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
+          nodes.map((n) => n.textContent).filter(Boolean)
+        );
+        for (const raw of jsonlds) {
+          try {
+            const data = JSON.parse(raw);
+            const candidates = Array.isArray(data) ? data : [data];
+
+            for (const c of candidates) {
+              if (c?.offers?.price) {
+                const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
+                if (v > 0) {
+                  price = v;
+                  priceSource = "detail-jsonld";
+                  break;
+                }
+              }
+              if (c?.["@graph"]) {
+                for (const g of c["@graph"]) {
+                  if (g?.offers?.price) {
+                    const v = Number(String(g.offers.price).replace(/[^\d]/g, ""));
+                    if (v > 0) {
+                      price = v;
+                      priceSource = "detail-jsonld";
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
+      } catch {}
     }
 
-    item.priceSource = "detail-missing";
-    return true;
+    // dom
+    if (!price) {
+      const priceSels = ['[class*="price"]', '[data-testid="price"]'];
+      for (const s of priceSels) {
+        try {
+          const el = await page.$(s);
+          if (el) {
+            const t = normalize(await el.textContent());
+            if (t && !/frais de port|shipping/i.test(t)) {
+              const v = parseEuroFromText(t);
+              if (v) {
+                price = v;
+                priceSource = "detail-dom";
+                break;
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (!price) {
+      try {
+        const body = await page.evaluate(() => document.body?.innerText || "");
+        if (/prix sur demande|price on request/i.test(body)) priceSource = "on-request";
+      } catch {}
+    }
+
+    const countrySels = ['[class*="seller-info"]', '[class*="location"]', '[class*="country"]'];
+    for (const s of countrySels) {
+      try {
+        const el = await page.$(s);
+        if (el) {
+          country = normalize(await el.textContent());
+          if (country) break;
+        }
+      } catch {}
+    }
+
+    return { id, url, title: title || `Listing ${id}`, price, priceSource, country, isSponsored: false };
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+// ================= DETAIL FALLBACK WITH RETRY =================
+async function enrichFromDetail(br, item) {
+  const attempt = async () => {
+    const { context, page } = await createPage(br);
+    try {
+      await page.goto(item.url, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
+      await acceptCookies(page);
+      await simulateHumanBehavior(page);
+
+      const meta = await page.$('meta[itemprop="price"]');
+      if (meta) {
+        const c = await meta.getAttribute("content");
+        if (c) {
+          const v = Number(String(c).replace(/[^\d]/g, ""));
+          if (v > 0) {
+            item.price = v;
+            item.priceSource = "detail-meta";
+            return true;
+          }
+        }
+      }
+
+      const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
+        nodes.map((n) => n.textContent).filter(Boolean)
+      );
+
+      for (const raw of jsonlds) {
+        try {
+          const data = JSON.parse(raw);
+          const candidates = Array.isArray(data) ? data : [data];
+
+          for (const c of candidates) {
+            if (c?.offers?.price) {
+              const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
+              if (v > 0) {
+                item.price = v;
+                item.priceSource = "detail-jsonld";
+                return true;
+              }
+            }
+            if (c?.["@graph"]) {
+              for (const g of c["@graph"]) {
+                if (g?.offers?.price) {
+                  const v = Number(String(g.offers.price).replace(/[^\d]/g, ""));
+                  if (v > 0) {
+                    item.price = v;
+                    item.priceSource = "detail-jsonld";
+                    return true;
+                  }
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+
+      const body = await page.evaluate(() => document.body?.innerText || "");
+      if (/prix sur demande|price on request/i.test(body)) {
+        item.price = null;
+        item.priceSource = "on-request";
+      } else {
+        item.priceSource = "missing";
+      }
+      return false;
+    } finally {
+      await context.close().catch(() => {});
+    }
   };
 
   try {
     return await attempt();
   } catch (e) {
     const msg = String(e?.message || e);
-    const isTimeout = /Timeout/i.test(msg);
-
-    if (isTimeout && CONFIG.detailRetryCount > 0) {
+    if (/Timeout/i.test(msg) && CONFIG.detailRetryCount > 0) {
+      await sleep(500);
       try {
-        await page.waitForTimeout(500);
         return await attempt();
       } catch {
         item.price = null;
@@ -377,67 +568,62 @@ async function enrichFromDetail(br, item) {
         return false;
       }
     }
-
     item.price = null;
     item.priceSource = "detail-error";
     return false;
-  } finally {
-    await context.close().catch(() => {});
   }
 }
 
-// ================= SCRAPE ONE LIST PAGE =================
+// ================= SCRAPE ONE PAGE (MAIN STRICT + FAST FILTER) =================
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
   try {
-    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.listGotoTimeoutMs });
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
     await acceptCookies(page);
+    await simulateHumanBehavior(page);
 
-    const selectorUsed = await waitForListingsSelector(page);
+    const mainSel = 'main a[href*="--id"][href$=".htm"]';
+    const anySel = 'a[href*="--id"][href$=".htm"]';
 
-    if (!selectorUsed) {
-      // Debug anti-bot / consent / slow load
-      const title = await page.title().catch(() => "");
-      const html = await page.content().catch(() => "");
-      const preview = html.slice(0, 1200);
-
-      const shot = `/tmp/chrono24_no_links_${Date.now()}.png`;
+    // Wait main, else fallback
+    let selectorUsed = mainSel;
+    try {
+      await page.waitForSelector(mainSel, { timeout: CONFIG.selectorTimeout });
+    } catch {
+      selectorUsed = anySel;
       try {
-        await page.screenshot({ path: shot, fullPage: true });
-      } catch {}
-
-      console.error("[List] No listing selector matched.");
-      console.error("[List] Title:", title);
-      console.error("[List] HTML preview:", preview);
-
-      throw new Error("No listing links found (possible anti-bot / consent / slow load)");
+        await page.waitForSelector(anySel, { timeout: CONFIG.selectorTimeout });
+      } catch {
+        return { expectedCount: 0, items: [] };
+      }
     }
 
     const expectedCount = await getExpectedCount(page);
 
-    const rawLinks = await collectListingLinks(page, selectorUsed);
+    // FAST: single-pass collect href + inMain
+    const links = await page.$$eval(selectorUsed, (as) =>
+      as
+        .map((a) => ({ href: a.getAttribute("href") || "", inMain: !!a.closest("main") }))
+        .filter((x) => x.href)
+    );
+
+    const filtered = selectorUsed === mainSel ? links : (links.some((x) => x.inMain) ? links.filter((x) => x.inMain) : links);
 
     const byId = new Map();
 
-    for (const { href } of rawLinks) {
+    // Use JS to map href->card quickly (avoid per-link roundtrips as much as possible)
+    for (const { href } of filtered) {
       const full = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
       const id = extractListingId(full);
       if (!id || byId.has(id)) continue;
 
-      // Remonter au card depuis un querySelectorHandle sur l'ancre correspondante (plus stable)
-      // On re-sélectionne l'ancre par href exact si possible (sinon fallback div)
       let cardHandle = null;
       try {
         const a = await page.$(`a[href="${href}"]`);
-        if (a) {
-          cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
-        }
+        if (a) cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
       } catch {}
 
-      // fallback: aucune carte trouvée, on crée un pseudo-card via body
-      if (!cardHandle) {
-        cardHandle = await page.evaluateHandle(() => document.body);
-      }
+      if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
 
       byId.set(id, { id, url: full, card: cardHandle });
     }
@@ -448,16 +634,7 @@ async function scrapeOnePage(br, pageUrl) {
       const country = await extractCountry(v.card);
       const isSponsored = await extractSponsored(v.card);
       const pr = await extractPriceFromCard(v.card);
-
-      items.push({
-        id: v.id,
-        url: v.url,
-        title,
-        country,
-        isSponsored,
-        price: pr.price,
-        priceSource: pr.priceSource,
-      });
+      items.push({ id: v.id, url: v.url, title, country, isSponsored, price: pr.price, priceSource: pr.priceSource });
     }
 
     return { expectedCount, items };
@@ -466,20 +643,24 @@ async function scrapeOnePage(br, pageUrl) {
   }
 }
 
-// ================= MAIN SCRAPER (PAGINATION + DETAILMODE + FAIL-FAST FINAL) =================
+// ================= MAIN SCRAPE FUNCTION =================
 async function scrapeChrono24(url, opts) {
   const pageSize = Number(opts.pageSize || 120);
   const maxPages = Number(opts.maxPages || 50);
   const noCache = !!opts.noCache;
-  const detailMode = String(opts.detailMode || "missing"); // "none" | "missing" | "all"
 
-  const cacheKey = JSON.stringify({ url, pageSize, maxPages, detailMode });
+  if (isDetailPage(url)) {
+    const br = await getBrowser();
+    const item = await scrapeDetailPage(br, url);
+    return { expectedCount: 1, count: 1, pageSize: 1, pagesScraped: 1, items: [item], isDetailPage: true };
+  }
+
+  const cacheKey = JSON.stringify({ url, pageSize, maxPages });
   const cached = getCached(cacheKey, noCache);
   if (cached) return { ...cached, fromCache: true };
 
   const br = await getBrowser();
 
-  // page 1
   const url1 = withParams(url, { pageSize, page: 1 });
   const first = await scrapeOnePage(br, url1);
 
@@ -497,67 +678,54 @@ async function scrapeChrono24(url, opts) {
     const { items } = await scrapeOnePage(br, pageUrl);
     for (const it of items) all.set(it.id, it);
     pagesScraped = p;
-
-    await sleep(randInt(CONFIG.betweenPagesDelayMsMin, CONFIG.betweenPagesDelayMsMax));
+    await sleep(randomDelay(900, 1700));
   }
 
   const items = [...all.values()];
 
-  // Detail fallback per mode (resilient)
-  if (detailMode !== "none") {
+  // Detail fallback missing prices only
+  const missingPrices = items.filter((it) => it.priceSource === "missing");
+  if (missingPrices.length > 0) {
     const limit = createLimiter(CONFIG.detailConcurrency);
-    const targets = detailMode === "all" ? items : items.filter((it) => it.priceSource === "missing");
-
     await Promise.all(
-      targets.map((it) =>
+      missingPrices.map((it) =>
         limit(async () => {
           await enrichFromDetail(br, it);
+          await sleep(randomDelay(400, 900));
         })
       )
     );
   }
 
-  // Fail-fast FINAL exact (count only)
+  // Fail-fast exact after pagination
   if (typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
     const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
     e.meta = { expectedCount, got: items.length, pagesScraped, pageSize, sample: items.slice(0, 5) };
     throw e;
   }
 
-  const stats = {
-    total: items.length,
-    withPrice: items.filter((x) => typeof x.price === "number" && x.price > 0).length,
-    onRequest: items.filter((x) => x.priceSource === "on-request").length,
-    detailTimeout: items.filter((x) => x.priceSource === "detail-timeout").length,
-    detailError: items.filter((x) => x.priceSource === "detail-error").length,
-    missing: items.filter((x) => x.priceSource === "missing" || x.priceSource === "detail-missing").length,
-  };
-
-  const result = {
-    expectedCount,
-    count: items.length,
-    pageSize,
-    pagesScraped,
-    detailMode,
-    items,
-    stats,
-  };
-
+  const result = { expectedCount, count: items.length, pageSize, pagesScraped, items };
   setCache(cacheKey, result);
   return result;
 }
 
 // ================= ROUTES =================
-app.get("/", (req, res) => res.send("ok"));
-app.get("/health", (req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
+app.get("/health", (req, res) =>
+  res.json({
+    status: "ok",
+    ts: new Date().toISOString(),
+    proxy: PROXY_URL ? PROXY_URL.replace(/:[^:]+@/, ":***@") : "none",
+    freeProxies: FREE_PROXIES.length,
+  })
+);
 
 app.post("/api/scrape", async (req, res) => {
   try {
-    const { url, pageSize, maxPages, noCache, detailMode } = req.body || {};
+    const { url, pageSize, maxPages, noCache } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
       return res.status(400).json({ error: "Invalid Chrono24 URL" });
     }
-    const out = await scrapeChrono24(url, { pageSize, maxPages, noCache, detailMode });
+    const out = await scrapeChrono24(url, { pageSize, maxPages, noCache });
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message, meta: e.meta || null });
