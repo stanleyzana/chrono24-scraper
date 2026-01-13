@@ -1,14 +1,13 @@
 /**
- * Chrono24 Bulletproof Scraper (PRO)
- * - CommonJS (require), no external concurrency deps
- * - Pagination multi-pages (page + pageSize) using URLSearchParams (keeps original query params)
- * - Link-first STRICT: ONLY `main a[href*="--id"][href$=".htm"]`
- * - Dedup STRICT: ONLY /--id(\d+)\.htm/i
- * - Fast by default: detailMode controls detail scraping: "none" | "missing" | "all"
- * - Detail fallback is resilient: longer timeout + 1 retry on timeout, NEVER crashes the whole batch
- * - Fail-fast FINAL exact (only on count) when detailMode is irrelevant:
- *     If expectedCount found and after pagination+dedup count != expectedCount => 500 with meta
- * - Adds small delay between page navigations to reduce rate limiting (no fingerprint hacks)
+ * Chrono24 Bulletproof Scraper (Render-safe)
+ * ✅ Pagination multi-pages (page + pageSize) via URLSearchParams (conserve les query params d'origine)
+ * ✅ Link-first STRICT: on prend d’abord les liens dans <main>
+ * ✅ Fallback contrôlé: si <main> ne charge pas sur Render, on prend les liens globaux MAIS on filtre ceux qui sont dans <main> si possible
+ * ✅ Dedup STRICT: uniquement /--id(\d+)\.htm/i
+ * ✅ detailMode: "none" | "missing" | "all" (par défaut "missing")
+ * ✅ Détail résilient: timeout + retry + NE FAIT PAS PLANTER le batch (marque detail-timeout / detail-error)
+ * ✅ Fail-fast FINAL sur le count UNIQUEMENT (pagination), pas sur les prix
+ * ✅ Debug anti-bot: si aucun lien trouvé, log title + html preview + screenshot path
  */
 
 const express = require("express");
@@ -23,23 +22,20 @@ const PORT = process.env.PORT || 3001;
 
 // ================= CONFIG =================
 const CONFIG = {
-  cacheTTLms: 10 * 60 * 1000, // 10 min
+  cacheTTLms: 10 * 60 * 1000,
   viewport: { width: 1920, height: 1080 },
   locale: "fr-FR",
   userAgent:
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 
-  // Timeouts
-  listGotoTimeoutMs: 60000,
-  listSelectorTimeoutMs: 30000,
-  detailGotoTimeoutMs: 60000,
-  detailRetryCount: 1, // one retry on timeout
+  listGotoTimeoutMs: 90000,
+  listSelectorTimeoutMs: 60000,
 
-  // Concurrency
+  detailGotoTimeoutMs: 60000,
+  detailRetryCount: 1,
   detailConcurrency: 4,
 
-  // Politeness
   betweenPagesDelayMsMin: 300,
   betweenPagesDelayMsMax: 800,
 };
@@ -73,12 +69,8 @@ function createLimiter(concurrency) {
     });
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-function randInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
 // ================= CACHE =================
 const cache = new Map();
@@ -118,7 +110,7 @@ async function createPage(br) {
 
   const page = await context.newPage();
 
-  // speed/stability: block heavy resources
+  // blocage ressources lourdes
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     if (["image", "font", "media"].includes(t)) route.abort();
@@ -132,12 +124,10 @@ async function createPage(br) {
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
-
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
-
 function parseEuroFromText(s) {
   const t = normalize(s);
   const m = t.match(/(\d{1,3}(?:[ .]\d{3})+)\s?€/);
@@ -145,7 +135,6 @@ function parseEuroFromText(s) {
   const v = Number(m[1].replace(/[ .]/g, ""));
   return Number.isFinite(v) ? v : null;
 }
-
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
@@ -182,7 +171,57 @@ async function getExpectedCount(page) {
   }
 }
 
-// ================= CARD EXTRACTION (LIST) =================
+// ================= LIST LINK DISCOVERY (Render-safe) =================
+async function waitForListingsSelector(page) {
+  const primary = 'main a[href*="--id"][href$=".htm"]';
+  const fallback = 'a[href*="--id"][href$=".htm"]';
+
+  // Primary: main
+  try {
+    await page.waitForSelector(primary, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
+    return primary;
+  } catch {}
+
+  // Fallback: anywhere
+  try {
+    await page.waitForSelector(fallback, { timeout: 15000, state: "attached" });
+    return fallback;
+  } catch {}
+
+  return null;
+}
+
+/**
+ * Retourne des liens d'annonces sous forme d'objets:
+ * [{ href, inMain }]
+ * - si on a dû utiliser le fallback global, on filtre inMain=true si possible
+ */
+async function collectListingLinks(page, selectorUsed) {
+  const sel = selectorUsed;
+  const links = await page.$$eval(sel, (as) =>
+    as
+      .map((a) => {
+        const href = a.getAttribute("href") || "";
+        const inMain = !!a.closest("main");
+        return { href, inMain };
+      })
+      .filter((x) => x.href)
+  );
+
+  if (sel.startsWith("main ")) {
+    // déjà strict
+    return links.map((x) => ({ href: x.href, inMain: true }));
+  }
+
+  // Fallback global: si on a des liens "dans main", on ne garde QUE ceux-là
+  const inMainLinks = links.filter((x) => x.inMain);
+  if (inMainLinks.length > 0) return inMainLinks;
+
+  // Sinon, dernier recours: retourner tout (peut inclure parasites, mais dédup par ID aidera)
+  return links;
+}
+
+// ================= CARD EXTRACTION =================
 async function extractTitle(card) {
   const sels = [".article-title", "h3", "h2"];
   for (const s of sels) {
@@ -219,7 +258,7 @@ async function extractSponsored(card) {
 }
 
 async function extractPriceFromCard(card) {
-  // 1) meta itemprop price (rare on list, but try)
+  // meta itemprop
   try {
     const meta = await card.$('meta[itemprop="price"]');
     if (meta) {
@@ -231,13 +270,13 @@ async function extractPriceFromCard(card) {
     }
   } catch {}
 
-  // 2) "on request"
+  // on-request
   try {
     const txt = await card.evaluate((n) => n.innerText || "");
     if (/prix sur demande|price on request/i.test(txt)) return { price: null, priceSource: "on-request" };
   } catch {}
 
-  // 3) price blocks (inside card only)
+  // price blocks
   const sels = ['[data-testid="price"]', '[class*="price"]'];
   for (const s of sels) {
     try {
@@ -264,7 +303,6 @@ async function enrichFromDetail(br, item) {
     await page.goto(item.url, { waitUntil: "domcontentloaded", timeout: CONFIG.detailGotoTimeoutMs });
     await acceptCookies(page);
 
-    // meta itemprop
     const meta = await page.$('meta[itemprop="price"]');
     if (meta) {
       const c = await meta.getAttribute("content");
@@ -278,7 +316,6 @@ async function enrichFromDetail(br, item) {
       }
     }
 
-    // JSON-LD
     const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
       nodes.map((n) => n.textContent).filter(Boolean)
     );
@@ -313,7 +350,6 @@ async function enrichFromDetail(br, item) {
       } catch {}
     }
 
-    // on-request fallback
     const body = await page.evaluate(() => document.body?.innerText || "");
     if (/prix sur demande|price on request/i.test(body)) {
       item.price = null;
@@ -350,32 +386,60 @@ async function enrichFromDetail(br, item) {
   }
 }
 
-// ================= SCRAPE ONE LIST PAGE (LINK-FIRST STRICT) =================
+// ================= SCRAPE ONE LIST PAGE =================
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
   try {
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.listGotoTimeoutMs });
     await acceptCookies(page);
 
-    await page.waitForSelector('main a[href*="--id"][href$=".htm"]', {
-      timeout: CONFIG.listSelectorTimeoutMs,
-    });
+    const selectorUsed = await waitForListingsSelector(page);
+
+    if (!selectorUsed) {
+      // Debug anti-bot / consent / slow load
+      const title = await page.title().catch(() => "");
+      const html = await page.content().catch(() => "");
+      const preview = html.slice(0, 1200);
+
+      const shot = `/tmp/chrono24_no_links_${Date.now()}.png`;
+      try {
+        await page.screenshot({ path: shot, fullPage: true });
+      } catch {}
+
+      console.error("[List] No listing selector matched.");
+      console.error("[List] Title:", title);
+      console.error("[List] HTML preview:", preview);
+
+      throw new Error("No listing links found (possible anti-bot / consent / slow load)");
+    }
 
     const expectedCount = await getExpectedCount(page);
 
-    const links = await page.$$('main a[href*="--id"][href$=".htm"]');
+    const rawLinks = await collectListingLinks(page, selectorUsed);
+
     const byId = new Map();
 
-    for (const link of links) {
-      const href = await link.getAttribute("href");
-      if (!href) continue;
+    for (const { href } of rawLinks) {
       const full = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
-
       const id = extractListingId(full);
       if (!id || byId.has(id)) continue;
 
-      const card = await link.evaluateHandle((a) => a.closest("article") || a.closest("li") || a.closest("div"));
-      byId.set(id, { id, url: full, card });
+      // Remonter au card depuis un querySelectorHandle sur l'ancre correspondante (plus stable)
+      // On re-sélectionne l'ancre par href exact si possible (sinon fallback div)
+      let cardHandle = null;
+      try {
+        const a = await page.$(`a[href="${href}"]`);
+        if (a) {
+          cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
+        }
+      } catch {}
+
+      // fallback: aucune carte trouvée, on crée un pseudo-card via body
+      if (!cardHandle) {
+        cardHandle = await page.evaluateHandle(() => document.body);
+      }
+
+      byId.set(id, { id, url: full, card: cardHandle });
     }
 
     const items = [];
@@ -402,7 +466,7 @@ async function scrapeOnePage(br, pageUrl) {
   }
 }
 
-// ================= MAIN (PAGINATION + DETAILMODE + FAIL-FAST FINAL) =================
+// ================= MAIN SCRAPER (PAGINATION + DETAILMODE + FAIL-FAST FINAL) =================
 async function scrapeChrono24(url, opts) {
   const pageSize = Number(opts.pageSize || 120);
   const maxPages = Number(opts.maxPages || 50);
@@ -439,14 +503,10 @@ async function scrapeChrono24(url, opts) {
 
   const items = [...all.values()];
 
-  // detail fallback per mode (resilient, never crashes batch)
-  const limit = createLimiter(CONFIG.detailConcurrency);
-
+  // Detail fallback per mode (resilient)
   if (detailMode !== "none") {
-    const targets =
-      detailMode === "all"
-        ? items
-        : items.filter((it) => it.priceSource === "missing");
+    const limit = createLimiter(CONFIG.detailConcurrency);
+    const targets = detailMode === "all" ? items : items.filter((it) => it.priceSource === "missing");
 
     await Promise.all(
       targets.map((it) =>
@@ -457,14 +517,13 @@ async function scrapeChrono24(url, opts) {
     );
   }
 
-  // FAIL-FAST FINAL EXACT on count (true bulletproof for pagination)
+  // Fail-fast FINAL exact (count only)
   if (typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
     const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
     e.meta = { expectedCount, got: items.length, pagesScraped, pageSize, sample: items.slice(0, 5) };
     throw e;
   }
 
-  // stats
   const stats = {
     total: items.length,
     withPrice: items.filter((x) => typeof x.price === "number" && x.price > 0).length,
