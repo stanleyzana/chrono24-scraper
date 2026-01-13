@@ -1,15 +1,27 @@
 {
   "name": "chrono24-scraper",
   "version": "2.0.0",
+  "description": "Bulletproof Chrono24 scraper with pagination support",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
+  "keywords": [
+    "chrono24",
+    "scraper",
+    "playwright",
+    "watches"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "p-limit": "^6.1.0",
     "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
