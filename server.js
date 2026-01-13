@@ -1,128 +1,78 @@
-/**
- * Chrono24 Scraper — PRÊT À COLLER (prix récupérés via pages détail)
- *
- * ✅ Scrape les pages liste (page/pageSize) pour récupérer IDs + URLs
- * ✅ Récupère les PRIX en ouvrant les pages DÉTAIL (meta[itemprop=price] ou JSON-LD)
- * ✅ Évite les timeouts Lovable : budget temps + timeout détail + limite de lookups
- * ✅ Pas de fail-fast quand tu ne scrapes pas toutes les pages (partial:true)
- *
- * Body POST /api/scrape (exemples) :
- * 1) Rapide (liste + enrich prix limité)
- * {
- *   "url": "https://www.chrono24.fr/patekphilippe/ref-5738r001.htm",
- *   "pageSize": 30,
- *   "maxPages": 1,
- *   "enrichPrices": true,
- *   "maxDetailLookups": 30,
- *   "detailTimeBudgetMs": 150000,
- *   "noCache": true
- * }
- *
- * 2) Liste seulement (aucun détail)
- * {
- *   "url": "...",
- *   "pageSize": 30,
- *   "maxPages": 1,
- *   "enrichPrices": false,
- *   "noCache": true
- * }
- */
-
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3001;
 
-// ================= PROXY CONFIG (kept, safe-trim) =================
+// ===== Proxy config kept (safe trim), but optional =====
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
-const FREE_PROXIES = [
-  // Add working ones from https://free-proxy-list.net/ (look for HTTPS, Elite, EU)
-];
-
-let currentProxyIndex = 0;
-function getNextProxy() {
-  if (PROXY_URL) return PROXY_URL;
-  if (FREE_PROXIES.length === 0) return null;
-  const proxy = FREE_PROXIES[currentProxyIndex % FREE_PROXIES.length];
-  currentProxyIndex++;
-  return proxy;
-}
-
-// ================= CONFIG =================
+// ===== Config =====
 const CONFIG = {
-  cacheTTLms: 10 * 60 * 1000,
   viewport: { width: 1920, height: 1080 },
   locale: "fr-FR",
+  acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
   userAgents: [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
   ],
-  acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-
-  // list
-  pageTimeout: 90000,
-  selectorTimeout: 60000,
-
-  // detail
-  detailConcurrency: 3,
-  detailGotoTimeoutMs: 20000,
+  listGotoTimeoutMs: 90000,
+  listSelectorTimeoutMs: 60000,
+  detailGotoTimeoutMs: 25000,
   detailRetryCount: 1,
+  enrichConcurrency: 4,
 };
 
-// ================= UTILS =================
-function randomDelay(min = 250, max = 700) {
-  return Math.floor(Math.random() * (max - min) + min);
+// ===== Small in-memory cache (debugging convenience) =====
+const cache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+function cacheGet(key) {
+  const e = cache.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > CACHE_TTL_MS) return null;
+  return e.data;
 }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function getRandomUserAgent() {
-  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
+function cacheSet(key, data) {
+  cache.set(key, { ts: Date.now(), data });
 }
 
+// ===== Utils =====
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
-
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
-
-function parseEuroFromText(s) {
-  const t = normalize(s);
-  const patterns = [
-    /(\d{1,3}(?:[ .]\d{3})+)\s?€/,
-    /€\s?(\d{1,3}(?:[ ,.]\d{3})+)/,
-    /(\d{4,})\s?€/,
-  ];
-  for (const pattern of patterns) {
-    const m = t.match(pattern);
-    if (m) {
-      const v = Number(m[1].replace(/[ .,]/g, ""));
-      if (Number.isFinite(v) && v > 100) return v;
-    }
-  }
-  return null;
-}
-
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
-  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
+  Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, String(v)));
   return u.toString();
 }
+function parseEuroFromText(s) {
+  const t = normalize(s);
+  const m = t.match(/(\d{1,3}(?:[ .]\d{3})+)\s?€/);
+  if (!m) return null;
+  const v = Number(m[1].replace(/[ .]/g, ""));
+  return Number.isFinite(v) ? v : null;
+}
 
-// ================= INLINE CONCURRENCY LIMITER =================
+// ===== Concurrency limiter (no deps) =====
 function createLimiter(concurrency) {
   let active = 0;
   const queue = [];
+
   const runNext = () => {
     if (active >= concurrency) return;
     const job = queue.shift();
@@ -137,6 +87,7 @@ function createLimiter(concurrency) {
         runNext();
       });
   };
+
   return (fn) =>
     new Promise((resolve, reject) => {
       queue.push({ fn, resolve, reject });
@@ -144,76 +95,40 @@ function createLimiter(concurrency) {
     });
 }
 
-// ================= CACHE =================
-const cache = new Map();
-function getCached(key, noCache) {
-  if (noCache) return null;
-  const e = cache.get(key);
-  if (!e) return null;
-  if (Date.now() - e.ts > CONFIG.cacheTTLms) {
-    cache.delete(key);
-    return null;
-  }
-  return e.data;
-}
-function setCache(key, data) {
-  cache.set(key, { ts: Date.now(), data });
-}
-
-// ================= BROWSER =================
+// ===== Browser =====
 let browserInstance = null;
-let currentBrowserProxy = null;
-
 async function getBrowser(forceNew = false) {
-  const proxy = getNextProxy();
-
   if (browserInstance && forceNew) {
     await browserInstance.close().catch(() => {});
     browserInstance = null;
   }
-
-  if (browserInstance && proxy !== currentBrowserProxy) {
-    await browserInstance.close().catch(() => {});
-    browserInstance = null;
-  }
-
   if (!browserInstance) {
-    const launchOptions = {
+    const opts = {
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-      ],
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     };
-
-    if (proxy) {
-      console.log(`[Browser] Using proxy: ${proxy.replace(/:[^:]+@/, ":***@")}`);
-      launchOptions.proxy = { server: proxy };
+    if (PROXY_URL) {
+      opts.proxy = { server: PROXY_URL };
+      console.log("[Browser] Using proxy:", PROXY_URL.replace(/:[^:]+@/, ":***@"));
     } else {
-      console.log("[Browser] No proxy configured, using direct connection");
+      console.log("[Browser] Direct connection (no proxy)");
     }
-
-    browserInstance = await chromium.launch(launchOptions);
-    currentBrowserProxy = proxy;
+    browserInstance = await chromium.launch(opts);
   }
-
   return browserInstance;
 }
 
-async function createPage(br, stealth = true) {
-  const userAgent = getRandomUserAgent();
+function pickUA() {
+  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
+}
 
+async function createPage(br, stealth = true) {
   const context = await br.newContext({
     locale: CONFIG.locale,
-    userAgent,
+    userAgent: pickUA(),
     viewport: CONFIG.viewport,
     extraHTTPHeaders: {
       "Accept-Language": CONFIG.acceptLanguage,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-      "Accept-Encoding": "gzip, deflate, br",
       "Cache-Control": "no-cache",
       Pragma: "no-cache",
       "Upgrade-Insecure-Requests": "1",
@@ -225,21 +140,7 @@ async function createPage(br, stealth = true) {
 
   const page = await context.newPage();
 
-  if (stealth) {
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === "notifications"
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters);
-      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, "languages", { get: () => ["fr-FR", "fr", "en-US", "en"] });
-      window.chrome = { runtime: {} };
-    });
-  }
-
-  // block heavy resources
+  // light blocking
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -248,10 +149,16 @@ async function createPage(br, stealth = true) {
     else route.continue();
   });
 
+  if (stealth) {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      window.chrome = { runtime: {} };
+    });
+  }
+
   return { context, page };
 }
 
-// ================= PAGE HELPERS =================
 async function acceptCookies(page) {
   const sels = [
     "#onetrust-accept-btn-handler",
@@ -259,132 +166,115 @@ async function acceptCookies(page) {
     'button:has-text("Tout accepter")',
     'button:has-text("Accepter")',
     'button:has-text("J\'accepte")',
-    'button:has-text("Accept All")',
     'button:has-text("Accept")',
   ];
-  await page.waitForTimeout(randomDelay(350, 800));
+  await page.waitForTimeout(randInt(250, 650));
   for (const s of sels) {
     try {
       const b = await page.$(s);
       if (b) {
         await b.click().catch(() => {});
-        await page.waitForTimeout(randomDelay(200, 500));
+        await page.waitForTimeout(randInt(150, 400));
         return;
       }
     } catch {}
   }
 }
 
-async function simulateHumanBehavior(page) {
-  await page.evaluate(() => window.scrollTo(0, Math.random() * 500));
-  await page.waitForTimeout(randomDelay(150, 450));
-  await page.mouse.move(Math.random() * 800 + 100, Math.random() * 400 + 100);
+async function simulateHuman(page) {
+  try {
+    await page.evaluate(() => window.scrollTo(0, Math.random() * 500));
+    await page.waitForTimeout(randInt(150, 400));
+  } catch {}
 }
 
 async function getExpectedCount(page) {
   try {
-    const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    const patterns = [
-      /(\d+)\s+(?:annonces?|résultats?|montres?|watches?|listings?)/i,
-      /(?:Total|Résultats?|Found)[\s:]+(\d+)/i,
-    ];
-    for (const pattern of patterns) {
-      const m = bodyText.match(pattern);
-      if (m) return Number(m[1]);
-    }
-    return null;
+    const text = await page.evaluate(() => document.body?.innerText || "");
+    const m = text.match(/(\d+)\s+(?:annonces?|résultats?|montres?|watches?|listings?)/i);
+    return m ? Number(m[1]) : null;
   } catch {
     return null;
   }
 }
 
-// ================= CARD EXTRACTION =================
-async function extractTitle(card) {
-  const sels = [".article-title", "h3", "h2", '[class*="title"]'];
-  for (const s of sels) {
-    try {
-      const el = await card.$(s);
-      if (!el) continue;
-      const t = normalize(await el.textContent());
-      if (t) return t;
-    } catch {}
-  }
-  return null;
-}
-async function extractCountry(card) {
-  const sels = ['[class*="country"]', '[class*="location"]', '[class*="seller"]'];
-  for (const s of sels) {
-    try {
-      const el = await card.$(s);
-      if (!el) continue;
-      const t = normalize(await el.textContent());
-      if (t) return t;
-    } catch {}
-  }
-  return null;
-}
-async function extractSponsored(card) {
+// ===== Core: scrape ONE list page (fast, robust) =====
+async function scrapeListPage(pageUrl) {
+  const br = await getBrowser(false);
+  const { context, page } = await createPage(br, true);
+
   try {
-    const t = await card.evaluate((n) => n.innerText || "");
-    return /sponsor|promoted|publicité/i.test(t);
-  } catch {
-    return false;
-  }
-}
-async function extractPriceFromCard(card) {
-  // Try to get price from list if possible
-  try {
-    const meta = await card.$('meta[itemprop="price"]');
-    if (meta) {
-      const c = await meta.getAttribute("content");
-      if (c) {
-        const v = Number(String(c).replace(/[^\d]/g, ""));
-        if (v > 0) return { price: v, priceSource: "card-meta" };
-      }
+    console.log("[LIST] goto", pageUrl);
+    await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.listGotoTimeoutMs });
+    await acceptCookies(page);
+    await simulateHuman(page);
+
+    const mainSel = 'main a[href*="--id"]';
+    const anySel = 'a[href*="--id"]';
+
+    let selectorUsed = mainSel;
+    try {
+      await page.waitForSelector(mainSel, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
+    } catch {
+      selectorUsed = anySel;
+      await page.waitForSelector(anySel, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
     }
-  } catch {}
 
-  try {
-    const txt = await card.evaluate((n) => n.innerText || "");
-    if (/prix sur demande|price on request/i.test(txt)) return { price: null, priceSource: "on-request" };
-  } catch {}
+    const expectedCount = await getExpectedCount(page);
 
-  const sels = ['[data-testid="price"]', '[class*="price"]', '[class*="Price"]'];
-  for (const s of sels) {
-    try {
-      const el = await card.$(s);
-      if (!el) continue;
-      const t = normalize(await el.textContent());
-      if (!t) continue;
-      if (/frais de port|shipping/i.test(t) || /^\+/.test(t)) continue;
-      if (/prix sur demande|price on request/i.test(t)) return { price: null, priceSource: "on-request" };
-      const v = parseEuroFromText(t);
-      if (v) return { price: v, priceSource: "card-dom" };
-    } catch {}
+    const links = await page.$$eval(selectorUsed, (as) =>
+      as
+        .map((a) => ({
+          href: a.getAttribute("href") || "",
+          inMain: !!a.closest("main"),
+          text: (a.textContent || "").trim(),
+        }))
+        .filter((x) => x.href && x.href.includes("--id"))
+    );
+
+    let filtered = links;
+    if (selectorUsed === anySel && links.some((x) => x.inMain)) {
+      filtered = links.filter((x) => x.inMain);
+    }
+
+    // strict listing links
+    filtered = filtered.filter((x) => x.href.includes(".htm"));
+
+    const byId = new Map();
+    for (const l of filtered) {
+      const fullUrl = l.href.startsWith("http") ? l.href : `https://www.chrono24.fr${l.href}`;
+      const id = extractListingId(fullUrl);
+      if (!id || byId.has(id)) continue;
+      byId.set(id, {
+        id,
+        url: fullUrl,
+        title: l.text && l.text.length > 3 ? l.text : `Listing ${id}`,
+      });
+    }
+
+    return { expectedCount, items: [...byId.values()] };
+  } finally {
+    await context.close().catch(() => {});
   }
-
-  return { price: null, priceSource: "missing" };
 }
 
-// ================= DETAIL PRICE EXTRACTION (core fix) =================
-async function fetchPriceFromDetail(br, item) {
-  const attempt = async () => {
+// ===== Core: fetch price from detail page =====
+async function fetchPriceFromDetail(url) {
+  const br = await getBrowser(false);
+
+  const attemptOnce = async () => {
     const { context, page } = await createPage(br, false);
     try {
-      await page.goto(item.url, { waitUntil: "commit", timeout: CONFIG.detailGotoTimeoutMs });
+      await page.goto(url, { waitUntil: "commit", timeout: CONFIG.detailGotoTimeoutMs });
       await acceptCookies(page);
 
-      // meta[itemprop=price]
+      // meta price
       const meta = await page.$('meta[itemprop="price"]');
       if (meta) {
         const c = await meta.getAttribute("content");
         if (c) {
           const v = Number(String(c).replace(/[^\d]/g, ""));
-          if (v > 0) {
-            item.price = v;
-            item.priceSource = "detail-meta";
-            return true;
-          }
+          if (v > 0) return { price: v, priceSource: "detail-meta" };
         }
       }
 
@@ -400,21 +290,13 @@ async function fetchPriceFromDetail(br, item) {
           for (const c of candidates) {
             if (c?.offers?.price) {
               const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
-              if (v > 0) {
-                item.price = v;
-                item.priceSource = "detail-jsonld";
-                return true;
-              }
+              if (v > 0) return { price: v, priceSource: "detail-jsonld" };
             }
             if (c?.["@graph"]) {
               for (const g of c["@graph"]) {
                 if (g?.offers?.price) {
                   const v = Number(String(g.offers.price).replace(/[^\d]/g, ""));
-                  if (v > 0) {
-                    item.price = v;
-                    item.priceSource = "detail-jsonld";
-                    return true;
-                  }
+                  if (v > 0) return { price: v, priceSource: "detail-jsonld" };
                 }
               }
             }
@@ -424,144 +306,35 @@ async function fetchPriceFromDetail(br, item) {
 
       const body = await page.evaluate(() => document.body?.innerText || "");
       if (/prix sur demande|price on request/i.test(body)) {
-        item.price = null;
-        item.priceSource = "on-request";
-      } else {
-        item.price = null;
-        item.priceSource = "detail-missing";
+        return { price: null, priceSource: "on-request" };
       }
-      return false;
+
+      return { price: null, priceSource: "detail-missing" };
     } finally {
       await context.close().catch(() => {});
     }
   };
 
   try {
-    return await attempt();
+    return await attemptOnce();
   } catch (e) {
     const msg = String(e?.message || e);
     if (/Timeout/i.test(msg) && CONFIG.detailRetryCount > 0) {
-      await sleep(300);
       try {
-        return await attempt();
+        await sleep(300);
+        return await attemptOnce();
       } catch {
-        item.price = null;
-        item.priceSource = "detail-timeout";
-        return false;
+        return { price: null, priceSource: "detail-timeout" };
       }
     }
-    item.price = null;
-    item.priceSource = "detail-error";
-    return false;
+    return { price: null, priceSource: "detail-error" };
   }
 }
 
-// ================= SCRAPE ONE PAGE =================
-async function scrapeOnePage(br, pageUrl) {
-  const { context, page } = await createPage(br);
-
-  try {
-    console.log("[SCRAPE] goto:", pageUrl);
-
-    await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.pageTimeout });
-    await acceptCookies(page);
-    await simulateHumanBehavior(page);
-
-    const mainSel = 'main a[href*="--id"]';
-    const anySel = 'a[href*="--id"]';
-
-    let selectorUsed = mainSel;
-    try {
-      await page.waitForSelector(mainSel, { timeout: CONFIG.selectorTimeout, state: "attached" });
-    } catch {
-      selectorUsed = anySel;
-      try {
-        await page.waitForSelector(anySel, { timeout: CONFIG.selectorTimeout, state: "attached" });
-      } catch {
-        console.log("[SCRAPE] Aucun lien trouvé");
-        return { expectedCount: 0, items: [] };
-      }
-    }
-
-    const expectedCount = await getExpectedCount(page);
-
-    const links = await page.$$eval(selectorUsed, (as) =>
-      as
-        .map((a) => ({ href: a.getAttribute("href") || "", inMain: !!a.closest("main") }))
-        .filter((x) => x.href && x.href.includes("--id"))
-    );
-
-    let filtered = links;
-    if (selectorUsed === anySel && links.some((x) => x.inMain)) {
-      filtered = links.filter((x) => x.inMain);
-    }
-    filtered = filtered.filter((x) => x.href.includes(".htm"));
-
-    if (filtered.length === 0) {
-      console.log("[SCRAPE] Aucun lien valide après filtrage");
-      return { expectedCount, items: [] };
-    }
-
-    const byId = new Map();
-
-    for (const { href } of filtered) {
-      const fullUrl = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
-      const id = extractListingId(fullUrl);
-      if (!id || byId.has(id)) continue;
-
-      let cardHandle = null;
-      try {
-        const a = await page.$(`a[href="${href}"]`);
-        if (a) cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
-      } catch {}
-      if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
-
-      byId.set(id, { id, url: fullUrl, card: cardHandle });
-    }
-
-    const items = [];
-    for (const v of byId.values()) {
-      const title = (await extractTitle(v.card)) || `Listing ${v.id}`;
-      const country = await extractCountry(v.card);
-      const isSponsored = await extractSponsored(v.card);
-      const pr = await extractPriceFromCard(v.card);
-
-      items.push({
-        id: v.id,
-        url: v.url,
-        title,
-        country,
-        isSponsored,
-        price: pr.price,
-        priceSource: pr.priceSource,
-      });
-    }
-
-    console.log(`[SCRAPE] Page OK — ${items.length} annonces`);
-    return { expectedCount, items };
-  } finally {
-    await context.close().catch(() => {});
-  }
-}
-
-// ================= MAIN SCRAPER =================
-async function scrapeChrono24(url, opts) {
-  const pageSize = Number(opts.pageSize || 120);
-  const maxPages = Number(opts.maxPages || 50);
-  const noCache = !!opts.noCache;
-
-  const enrichPrices = opts.enrichPrices !== undefined ? !!opts.enrichPrices : true;
-  const maxDetailLookups = Number(opts.maxDetailLookups || pageSize);
-  const detailTimeBudgetMs = Number(opts.detailTimeBudgetMs || 150000);
-
-  const cacheKey = JSON.stringify({ url, pageSize, maxPages, enrichPrices, maxDetailLookups, detailTimeBudgetMs });
-  const cached = getCached(cacheKey, noCache);
-  if (cached) return { ...cached, fromCache: true };
-
-  const br = await getBrowser();
-
+// ===== Endpoint logic: scrape list across pages (partial-safe) =====
+async function scrapeList(url, pageSize, maxPages) {
   const url1 = withParams(url, { pageSize, page: 1 });
-  const first = await scrapeOnePage(br, url1);
+  const first = await scrapeListPage(url1);
 
   const expectedCount = first.expectedCount;
   const computedTotalPages =
@@ -574,100 +347,40 @@ async function scrapeChrono24(url, opts) {
 
   for (let p = 2; p <= totalPagesToScrape; p++) {
     const pageUrl = withParams(url, { pageSize, page: p });
-    const { items } = await scrapeOnePage(br, pageUrl);
-    for (const it of items) all.set(it.id, it);
+    const next = await scrapeListPage(pageUrl);
+    for (const it of next.items) all.set(it.id, it);
     pagesScraped = p;
-    await sleep(randomDelay(900, 1700));
+    await sleep(randInt(700, 1400));
   }
 
-  const items = [...all.values()];
-
-  // Price enrichment from detail pages (bounded)
-  let detailLookupsAttempted = 0;
-  let detailLookupsDone = 0;
-  const budgetStart = Date.now();
-
-  if (enrichPrices) {
-    const missing = items.filter((it) => it.priceSource === "missing");
-    const toEnrich = missing.slice(0, Math.max(0, maxDetailLookups));
-    const limit = createLimiter(CONFIG.detailConcurrency);
-
-    await Promise.all(
-      toEnrich.map((it) =>
-        limit(async () => {
-          if (Date.now() - budgetStart > detailTimeBudgetMs) {
-            it.priceSource = "skipped-budget";
-            return;
-          }
-          detailLookupsAttempted++;
-          const ok = await fetchPriceFromDetail(br, it);
-          if (ok) detailLookupsDone++;
-          await sleep(randomDelay(200, 600));
-        })
-      )
-    );
-  }
-
-  const isComplete = pagesScraped === computedTotalPages;
-
-  const result = {
+  return {
     scrapedAt: new Date().toISOString(),
     expectedCount,
-    count: items.length,
+    count: all.size,
     pageSize,
     pagesScraped,
     totalPages: computedTotalPages,
     maxPages,
-    partial: !isComplete,
-    warning: !isComplete ? `Partial scrape: scraped ${pagesScraped}/${computedTotalPages} pages` : null,
-
-    enrichPrices,
-    maxDetailLookups,
-    detailTimeBudgetMs,
-    detailLookupsAttempted,
-    detailLookupsDone,
-
-    items,
+    partial: pagesScraped !== computedTotalPages,
+    warning: pagesScraped !== computedTotalPages ? `Partial: ${pagesScraped}/${computedTotalPages} pages` : null,
+    items: [...all.values()],
   };
-
-  setCache(cacheKey, result);
-  return result;
 }
 
 // ================= ROUTES =================
+app.get("/", (req, res) => res.send("ok"));
+
 app.get("/health", (req, res) =>
   res.json({
     status: "ok",
     ts: new Date().toISOString(),
     proxy: PROXY_URL ? PROXY_URL.replace(/:[^:]+@/, ":***@") : "none",
-    freeProxies: FREE_PROXIES.length,
   })
 );
 
-app.post("/api/scrape", async (req, res) => {
-  console.log("[HIT] /api/scrape", new Date().toISOString());
-  console.log("[BODY]", req.body);
-
-  try {
-    const { url } = req.body || {};
-    if (!url || typeof url !== "string" || !url.includes("chrono24")) {
-      return res.status(400).json({ error: "Invalid Chrono24 URL" });
-    }
-    const out = await scrapeChrono24(url, req.body || {});
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: e.message, meta: e.meta || null });
-  }
-});
-
-app.post("/api/cache/clear", (req, res) => {
-  cache.clear();
-  res.json({ ok: true });
-});
-
+// Debug: can we reach Chrono24?
 app.get("/api/ping-chrono24", async (req, res) => {
-  let br;
-  let context;
+  let br, context;
   try {
     br = await getBrowser(true);
     const pageObj = await createPage(br, false);
@@ -675,49 +388,177 @@ app.get("/api/ping-chrono24", async (req, res) => {
     const page = pageObj.page;
 
     const resp = await page.goto("https://www.chrono24.fr", { waitUntil: "commit", timeout: 30000 });
-    const title = await page.title().catch(() => "");
     const status = resp ? resp.status() : null;
-
+    const title = await page.title().catch(() => "");
     res.json({ ok: true, status, title, timestamp: new Date().toISOString() });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e), timestamp: new Date().toISOString() });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   } finally {
     if (context) await context.close().catch(() => {});
   }
 });
 
+// Debug: load any url and return title + html head
 app.get("/api/debug-goto", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
 
-  const br = await getBrowser(true);
-  const { context, page } = await createPage(br, false);
-
+  let br, context;
   try {
+    br = await getBrowser(true);
+    const pageObj = await createPage(br, false);
+    context = pageObj.context;
+    const page = pageObj.page;
+
     const resp = await page.goto(String(url), { waitUntil: "commit", timeout: 30000 });
+    const status = resp ? resp.status() : null;
     const title = await page.title().catch(() => "");
     const html = await page.content().catch(() => "");
-    res.json({ ok: true, status: resp ? resp.status() : null, title, htmlHead: html.slice(0, 800) });
+    res.json({ ok: true, status, title, htmlHead: html.slice(0, 900) });
   } catch (e) {
-    const title = await page.title().catch(() => "");
-    res.status(500).json({ ok: false, error: String(e.message || e), title });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   } finally {
-    await context.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
   }
 });
 
-// ================= STARTUP =================
+// 1) FAST: list only
+app.post("/api/scrape-list", async (req, res) => {
+  console.log("[HIT] /api/scrape-list", new Date().toISOString(), req.body);
+
+  try {
+    const { url, pageSize = 30, maxPages = 1, noCache = false } = req.body || {};
+    if (!url || typeof url !== "string" || !url.includes("chrono24")) {
+      return res.status(400).json({ error: "Invalid Chrono24 URL" });
+    }
+
+    const key = JSON.stringify({ url, pageSize, maxPages });
+    if (!noCache) {
+      const cached = cacheGet(key);
+      if (cached) return res.json({ ...cached, fromCache: true });
+    }
+
+    const out = await scrapeList(url, Number(pageSize), Number(maxPages));
+    cacheSet(key, out);
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// 2) ENRICH PRICES: batch detail pages
+app.post("/api/enrich-prices", async (req, res) => {
+  console.log("[HIT] /api/enrich-prices", new Date().toISOString());
+
+  try {
+    const { items, urls, batchSize = 10 } = req.body || {};
+
+    const list =
+      Array.isArray(items) ? items :
+      Array.isArray(urls) ? urls.map((u) => ({ url: u })) :
+      [];
+
+    if (!Array.isArray(list) || list.length === 0) {
+      return res.status(400).json({ error: "Provide items:[{id,url}] or urls:[...]" });
+    }
+
+    const limit = createLimiter(CONFIG.enrichConcurrency);
+    const start = Date.now();
+
+    const slice = list.slice(0, Number(batchSize));
+    const results = await Promise.all(
+      slice.map((it) =>
+        limit(async () => {
+          const url = it.url;
+          const id = it.id || extractListingId(url) || null;
+
+          const pr = await fetchPriceFromDetail(url);
+          return { id, url, ...pr };
+        })
+      )
+    );
+
+    res.json({
+      ok: true,
+      batchSize: slice.length,
+      ms: Date.now() - start,
+      results,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Backward compatible: /api/scrape = list + (optional) enrich by budget
+app.post("/api/scrape", async (req, res) => {
+  console.log("[HIT] /api/scrape", new Date().toISOString(), req.body);
+
+  try {
+    const {
+      url,
+      pageSize = 30,
+      maxPages = 1,
+      noCache = false,
+      enrichPrices = true,
+      maxDetailLookups = Number(pageSize),
+      detailTimeBudgetMs = 150000
+    } = req.body || {};
+
+    if (!url || typeof url !== "string" || !url.includes("chrono24")) {
+      return res.status(400).json({ error: "Invalid Chrono24 URL" });
+    }
+
+    const key = JSON.stringify({ url, pageSize, maxPages, enrichPrices, maxDetailLookups, detailTimeBudgetMs });
+    if (!noCache) {
+      const cached = cacheGet(key);
+      if (cached) return res.json({ ...cached, fromCache: true });
+    }
+
+    const listOut = await scrapeList(url, Number(pageSize), Number(maxPages));
+
+    // Optional inline enrichment (bounded)
+    let attempted = 0;
+    let done = 0;
+
+    if (enrichPrices) {
+      const missing = listOut.items.slice(0, Number(maxDetailLookups));
+      const limit = createLimiter(CONFIG.enrichConcurrency);
+      const start = Date.now();
+
+      await Promise.all(
+        missing.map((it) =>
+          limit(async () => {
+            if (Date.now() - start > Number(detailTimeBudgetMs)) return;
+            attempted++;
+            const pr = await fetchPriceFromDetail(it.url);
+            if (pr.price != null) done++;
+            it.price = pr.price;
+            it.priceSource = pr.priceSource;
+            await sleep(randInt(150, 450));
+          })
+        )
+      );
+    }
+
+    const out = {
+      ...listOut,
+      enrichPrices,
+      maxDetailLookups,
+      detailTimeBudgetMs,
+      detailLookupsAttempted: attempted,
+      detailLookupsDone: done,
+    };
+
+    cacheSet(key, out);
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));
 
 process.on("SIGTERM", async () => {
-  try {
-    if (browserInstance) await browserInstance.close().catch(() => {});
-  } finally {
-    process.exit(0);
-  }
-});
-
-process.on("SIGINT", async () => {
   try {
     if (browserInstance) await browserInstance.close().catch(() => {});
   } finally {
