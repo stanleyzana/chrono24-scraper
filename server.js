@@ -1,14 +1,3 @@
-/**
- * Chrono24 Bulletproof Scraper v5 (Fixed, proxy untouched)
- * - Proxy section LEFT AS-IS (no changes)
- * - Chrome-only UAs
- * - Clean headers (no forced Sec-CH-UA / Sec-Fetch)
- * - Link-first strict in MAIN + safe global fallback filtered in ONE PASS (fast)
- * - Fail-fast exact after pagination
- * - Retry on timeout in enrichFromDetail (non-blocking)
- * - getBrowser(forceNew) properly closes old instance when forced (fix)
- */
-
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
@@ -19,7 +8,7 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3001;
 
-// ================= PROXY CONFIG (UNCHANGED) =================
+// ================= PROXY CONFIG (unchanged, safe trim) =================
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
 const FREE_PROXIES = [
@@ -62,10 +51,8 @@ function createLimiter(concurrency) {
     if (active >= concurrency) return;
     const job = queue.shift();
     if (!job) return;
-
     active++;
     const { fn, resolve, reject } = job;
-
     Promise.resolve()
       .then(fn)
       .then(resolve, reject)
@@ -80,6 +67,14 @@ function createLimiter(concurrency) {
       queue.push({ fn, resolve, reject });
       runNext();
     });
+}
+
+function randomDelay(min = 500, max = 2000) {
+  return Math.floor(Math.random() * (max - min) + min);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function getRandomUserAgent() {
+  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 }
 
 // ================= CACHE =================
@@ -98,15 +93,6 @@ function setCache(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
 
-// ================= RANDOM HELPERS =================
-function randomDelay(min = 500, max = 2000) {
-  return Math.floor(Math.random() * (max - min) + min);
-}
-function getRandomUserAgent() {
-  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // ================= BROWSER =================
 let browserInstance = null;
 let currentBrowserProxy = null;
@@ -114,14 +100,12 @@ let currentBrowserProxy = null;
 async function getBrowser(forceNew = false) {
   const proxy = getNextProxy();
 
-  // FIX: if forceNew, close old instance even if proxy didn't change
   if (browserInstance && forceNew) {
     console.log("[Browser] forceNew=true, closing existing browser");
     await browserInstance.close().catch(() => {});
     browserInstance = null;
   }
 
-  // If proxy changed, close old browser
   if (browserInstance && proxy !== currentBrowserProxy) {
     console.log("[Browser] Proxy changed, closing old browser");
     await browserInstance.close().catch(() => {});
@@ -140,7 +124,6 @@ async function getBrowser(forceNew = false) {
       ],
     };
 
-    // proxy untouched
     if (proxy) {
       console.log(`[Browser] Using proxy: ${proxy.replace(/:[^:]+@/, ":***@")}`);
       launchOptions.proxy = { server: proxy };
@@ -185,18 +168,15 @@ async function createPage(br, stealth = true) {
         parameters.name === "notifications"
           ? Promise.resolve({ state: Notification.permission })
           : originalQuery(parameters);
-
       Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, "languages", { get: () => ["fr-FR", "fr", "en-US", "en"] });
       window.chrome = { runtime: {} };
     });
   }
 
-  // keep your blocking rules (unchanged)
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
-
     if (["media", "font"].includes(t)) route.abort();
     else if (t === "image" && !url.includes("chrono24")) route.abort();
     else route.continue();
@@ -209,16 +189,13 @@ async function createPage(br, stealth = true) {
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
-
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
-
 function isDetailPage(url) {
   return /--id\d+\.htm/i.test(url);
 }
-
 function parseEuroFromText(s) {
   const t = normalize(s);
   const patterns = [
@@ -226,7 +203,6 @@ function parseEuroFromText(s) {
     /€\s?(\d{1,3}(?:[ ,.]\d{3})+)/,
     /(\d{4,})\s?€/,
   ];
-
   for (const pattern of patterns) {
     const m = t.match(pattern);
     if (m) {
@@ -236,7 +212,6 @@ function parseEuroFromText(s) {
   }
   return null;
 }
-
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
@@ -253,9 +228,7 @@ async function acceptCookies(page) {
     'button:has-text("Accept All")',
     'button:has-text("Accept")',
   ];
-
   await page.waitForTimeout(randomDelay(500, 1500));
-
   for (const s of sels) {
     try {
       const b = await page.$(s);
@@ -304,7 +277,6 @@ async function extractTitle(card) {
   }
   return null;
 }
-
 async function extractCountry(card) {
   const sels = ['[class*="country"]', '[class*="location"]', '[class*="seller"]'];
   for (const s of sels) {
@@ -317,7 +289,6 @@ async function extractCountry(card) {
   }
   return null;
 }
-
 async function extractSponsored(card) {
   try {
     const t = await card.evaluate((n) => n.innerText || "");
@@ -326,7 +297,6 @@ async function extractSponsored(card) {
     return false;
   }
 }
-
 async function extractPriceFromCard(card) {
   try {
     const meta = await card.$('meta[itemprop="price"]');
@@ -353,136 +323,12 @@ async function extractPriceFromCard(card) {
       if (!t) continue;
       if (/frais de port|shipping/i.test(t) || /^\+/.test(t)) continue;
       if (/prix sur demande|price on request/i.test(t)) return { price: null, priceSource: "on-request" };
-
       const v = parseEuroFromText(t);
       if (v) return { price: v, priceSource: "card-dom" };
     } catch {}
   }
 
   return { price: null, priceSource: "missing" };
-}
-
-// ================= DETAIL PAGE SCRAPING =================
-async function scrapeDetailPage(br, url) {
-  const { context, page } = await createPage(br);
-  try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.pageTimeout });
-    await acceptCookies(page);
-    await simulateHumanBehavior(page);
-
-    const id = extractListingId(url);
-    let title = null;
-    let price = null;
-    let priceSource = "missing";
-    let country = null;
-
-    const titleSels = ["h1", '[class*="title"]', ".article-title"];
-    for (const s of titleSels) {
-      try {
-        const el = await page.$(s);
-        if (el) {
-          title = normalize(await el.textContent());
-          if (title) break;
-        }
-      } catch {}
-    }
-
-    // meta
-    try {
-      const meta = await page.$('meta[itemprop="price"]');
-      if (meta) {
-        const c = await meta.getAttribute("content");
-        if (c) {
-          const v = Number(String(c).replace(/[^\d]/g, ""));
-          if (v > 0) {
-            price = v;
-            priceSource = "detail-meta";
-          }
-        }
-      }
-    } catch {}
-
-    // json-ld
-    if (!price) {
-      try {
-        const jsonlds = await page.$$eval('script[type="application/ld+json"]', (nodes) =>
-          nodes.map((n) => n.textContent).filter(Boolean)
-        );
-        for (const raw of jsonlds) {
-          try {
-            const data = JSON.parse(raw);
-            const candidates = Array.isArray(data) ? data : [data];
-
-            for (const c of candidates) {
-              if (c?.offers?.price) {
-                const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
-                if (v > 0) {
-                  price = v;
-                  priceSource = "detail-jsonld";
-                  break;
-                }
-              }
-              if (c?.["@graph"]) {
-                for (const g of c["@graph"]) {
-                  if (g?.offers?.price) {
-                    const v = Number(String(g.offers.price).replace(/[^\d]/g, ""));
-                    if (v > 0) {
-                      price = v;
-                      priceSource = "detail-jsonld";
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-          } catch {}
-        }
-      } catch {}
-    }
-
-    // dom
-    if (!price) {
-      const priceSels = ['[class*="price"]', '[data-testid="price"]'];
-      for (const s of priceSels) {
-        try {
-          const el = await page.$(s);
-          if (el) {
-            const t = normalize(await el.textContent());
-            if (t && !/frais de port|shipping/i.test(t)) {
-              const v = parseEuroFromText(t);
-              if (v) {
-                price = v;
-                priceSource = "detail-dom";
-                break;
-              }
-            }
-          }
-        } catch {}
-      }
-    }
-
-    if (!price) {
-      try {
-        const body = await page.evaluate(() => document.body?.innerText || "");
-        if (/prix sur demande|price on request/i.test(body)) priceSource = "on-request";
-      } catch {}
-    }
-
-    const countrySels = ['[class*="seller-info"]', '[class*="location"]', '[class*="country"]'];
-    for (const s of countrySels) {
-      try {
-        const el = await page.$(s);
-        if (el) {
-          country = normalize(await el.textContent());
-          if (country) break;
-        }
-      } catch {}
-    }
-
-    return { id, url, title: title || `Listing ${id}`, price, priceSource, country, isSponsored: false };
-  } finally {
-    await context.close().catch(() => {});
-  }
 }
 
 // ================= DETAIL FALLBACK WITH RETRY =================
@@ -515,7 +361,6 @@ async function enrichFromDetail(br, item) {
         try {
           const data = JSON.parse(raw);
           const candidates = Array.isArray(data) ? data : [data];
-
           for (const c of candidates) {
             if (c?.offers?.price) {
               const v = Number(String(c.offers.price).replace(/[^\d]/g, ""));
@@ -585,7 +430,6 @@ async function scrapeOnePage(br, pageUrl) {
     const mainSel = 'main a[href*="--id"][href$=".htm"]';
     const anySel = 'a[href*="--id"][href$=".htm"]';
 
-    // Wait main, else fallback
     let selectorUsed = mainSel;
     try {
       await page.waitForSelector(mainSel, { timeout: CONFIG.selectorTimeout });
@@ -600,18 +444,21 @@ async function scrapeOnePage(br, pageUrl) {
 
     const expectedCount = await getExpectedCount(page);
 
-    // FAST: single-pass collect href + inMain
     const links = await page.$$eval(selectorUsed, (as) =>
       as
         .map((a) => ({ href: a.getAttribute("href") || "", inMain: !!a.closest("main") }))
         .filter((x) => x.href)
     );
 
-    const filtered = selectorUsed === mainSel ? links : (links.some((x) => x.inMain) ? links.filter((x) => x.inMain) : links);
+    const filtered =
+      selectorUsed === mainSel
+        ? links
+        : links.some((x) => x.inMain)
+        ? links.filter((x) => x.inMain)
+        : links;
 
     const byId = new Map();
 
-    // Use JS to map href->card quickly (avoid per-link roundtrips as much as possible)
     for (const { href } of filtered) {
       const full = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
       const id = extractListingId(full);
@@ -649,12 +496,6 @@ async function scrapeChrono24(url, opts) {
   const maxPages = Number(opts.maxPages || 50);
   const noCache = !!opts.noCache;
 
-  if (isDetailPage(url)) {
-    const br = await getBrowser();
-    const item = await scrapeDetailPage(br, url);
-    return { expectedCount: 1, count: 1, pageSize: 1, pagesScraped: 1, items: [item], isDetailPage: true };
-  }
-
   const cacheKey = JSON.stringify({ url, pageSize, maxPages });
   const cached = getCached(cacheKey, noCache);
   if (cached) return { ...cached, fromCache: true };
@@ -683,7 +524,6 @@ async function scrapeChrono24(url, opts) {
 
   const items = [...all.values()];
 
-  // Detail fallback missing prices only
   const missingPrices = items.filter((it) => it.priceSource === "missing");
   if (missingPrices.length > 0) {
     const limit = createLimiter(CONFIG.detailConcurrency);
@@ -697,7 +537,6 @@ async function scrapeChrono24(url, opts) {
     );
   }
 
-  // Fail-fast exact after pagination
   if (typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
     const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
     e.meta = { expectedCount, got: items.length, pagesScraped, pageSize, sample: items.slice(0, 5) };
@@ -719,7 +558,11 @@ app.get("/health", (req, res) =>
   })
 );
 
+// VERY IMPORTANT: log that requests are arriving
 app.post("/api/scrape", async (req, res) => {
+  console.log("[HIT] /api/scrape", new Date().toISOString());
+  console.log("[BODY]", req.body);
+
   try {
     const { url, pageSize, maxPages, noCache } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
@@ -737,39 +580,47 @@ app.post("/api/cache/clear", (req, res) => {
   res.json({ ok: true });
 });
 
-// ================= DEBUG: PING CHRONO24 =================
+// DEBUG: Ping chrono24 homepage
 app.get("/api/ping-chrono24", async (req, res) => {
   let br;
   let context;
 
   try {
-    br = await getBrowser(true); // force nouveau browser
+    br = await getBrowser(true);
     const pageObj = await createPage(br, false);
     context = pageObj.context;
     const page = pageObj.page;
 
-    const resp = await page.goto("https://www.chrono24.fr", {
-      waitUntil: "domcontentloaded",
-      timeout: 30000,
-    });
-
+    const resp = await page.goto("https://www.chrono24.fr", { waitUntil: "commit", timeout: 30000 });
     const title = await page.title().catch(() => "");
     const status = resp ? resp.status() : null;
 
-    res.json({
-      ok: true,
-      status,
-      title,
-      timestamp: new Date().toISOString(),
-    });
+    res.json({ ok: true, status, title, timestamp: new Date().toISOString() });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: String(e.message || e),
-      timestamp: new Date().toISOString(),
-    });
+    res.status(500).json({ ok: false, error: String(e.message || e), timestamp: new Date().toISOString() });
   } finally {
     if (context) await context.close().catch(() => {});
+  }
+});
+
+// DEBUG: Fetch any URL and return title + html head (proves what is returned)
+app.get("/api/debug-goto", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
+
+  const br = await getBrowser(true);
+  const { context, page } = await createPage(br, false);
+
+  try {
+    const resp = await page.goto(String(url), { waitUntil: "commit", timeout: 30000 });
+    const title = await page.title().catch(() => "");
+    const html = await page.content().catch(() => "");
+    res.json({ ok: true, status: resp ? resp.status() : null, title, htmlHead: html.slice(0, 800) });
+  } catch (e) {
+    const title = await page.title().catch(() => "");
+    res.status(500).json({ ok: false, error: String(e.message || e), title });
+  } finally {
+    await context.close().catch(() => {});
   }
 });
 
