@@ -1,0 +1,22 @@
+{
+  "name": "chrono24-scraper",
+  "version": "1.0.0",
+  "description": "Bulletproof Chrono24 scraper with Node.js, Express, and Playwright",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "install-browser": "npx playwright install --with-deps chromium"
+  },
+  "keywords": ["chrono24", "scraper", "playwright", "watches"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "playwright": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
