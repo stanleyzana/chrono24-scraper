@@ -1,3 +1,14 @@
+/**
+ * Chrono24 Scraper (Render + Lovable friendly)
+ * - Proxy config kept (PROXY_URL + FREE_PROXIES) but safe-trimmed
+ * - Page scraping: fast + reliable (waitUntil:"commit", waitForSelector state:"attached")
+ * - Link-first strict in MAIN + global fallback filtered in-main
+ * - Pagination supported (page + pageSize)
+ * - detailMode: "none" (fast) | "missing" (fetch detail only if price missing)
+ * - Logs requests and key steps
+ * - Debug endpoints: /api/ping-chrono24, /api/debug-goto
+ */
+
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
@@ -8,7 +19,7 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3001;
 
-// ================= PROXY CONFIG (unchanged, safe trim) =================
+// ================= PROXY CONFIG (kept) =================
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
 const FREE_PROXIES = [
@@ -36,11 +47,54 @@ const CONFIG = {
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
   ],
   acceptLanguage: "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+
   detailConcurrency: 3,
   pageTimeout: 90000,
   selectorTimeout: 60000,
   detailRetryCount: 1,
 };
+
+// ================= UTILS =================
+function randomDelay(min = 500, max = 2000) {
+  return Math.floor(Math.random() * (max - min) + min);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function getRandomUserAgent() {
+  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
+}
+
+function normalize(s) {
+  return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function extractListingId(url) {
+  const m = (url || "").match(/--id(\d+)\.htm/i);
+  return m ? m[1] : null;
+}
+
+function parseEuroFromText(s) {
+  const t = normalize(s);
+  const patterns = [
+    /(\d{1,3}(?:[ .]\d{3})+)\s?€/,
+    /€\s?(\d{1,3}(?:[ ,.]\d{3})+)/,
+    /(\d{4,})\s?€/,
+  ];
+  for (const pattern of patterns) {
+    const m = t.match(pattern);
+    if (m) {
+      const v = Number(m[1].replace(/[ .,]/g, ""));
+      if (Number.isFinite(v) && v > 100) return v;
+    }
+  }
+  return null;
+}
+
+function withParams(inputUrl, params) {
+  const u = new URL(inputUrl);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
+  return u.toString();
+}
 
 // ================= INLINE CONCURRENCY LIMITER =================
 function createLimiter(concurrency) {
@@ -51,8 +105,10 @@ function createLimiter(concurrency) {
     if (active >= concurrency) return;
     const job = queue.shift();
     if (!job) return;
+
     active++;
     const { fn, resolve, reject } = job;
+
     Promise.resolve()
       .then(fn)
       .then(resolve, reject)
@@ -67,14 +123,6 @@ function createLimiter(concurrency) {
       queue.push({ fn, resolve, reject });
       runNext();
     });
-}
-
-function randomDelay(min = 500, max = 2000) {
-  return Math.floor(Math.random() * (max - min) + min);
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function getRandomUserAgent() {
-  return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 }
 
 // ================= CACHE =================
@@ -174,6 +222,7 @@ async function createPage(br, stealth = true) {
     });
   }
 
+  // block heavy resources
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -185,39 +234,7 @@ async function createPage(br, stealth = true) {
   return { context, page };
 }
 
-// ================= HELPERS =================
-function normalize(s) {
-  return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
-}
-function extractListingId(url) {
-  const m = (url || "").match(/--id(\d+)\.htm/i);
-  return m ? m[1] : null;
-}
-function isDetailPage(url) {
-  return /--id\d+\.htm/i.test(url);
-}
-function parseEuroFromText(s) {
-  const t = normalize(s);
-  const patterns = [
-    /(\d{1,3}(?:[ .]\d{3})+)\s?€/,
-    /€\s?(\d{1,3}(?:[ ,.]\d{3})+)/,
-    /(\d{4,})\s?€/,
-  ];
-  for (const pattern of patterns) {
-    const m = t.match(pattern);
-    if (m) {
-      const v = Number(m[1].replace(/[ .,]/g, ""));
-      if (Number.isFinite(v) && v > 100) return v;
-    }
-  }
-  return null;
-}
-function withParams(inputUrl, params) {
-  const u = new URL(inputUrl);
-  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
-  return u.toString();
-}
-
+// ================= PAGE HELPERS =================
 async function acceptCookies(page) {
   const sels = [
     "#onetrust-accept-btn-handler",
@@ -277,6 +294,7 @@ async function extractTitle(card) {
   }
   return null;
 }
+
 async function extractCountry(card) {
   const sels = ['[class*="country"]', '[class*="location"]', '[class*="seller"]'];
   for (const s of sels) {
@@ -289,6 +307,7 @@ async function extractCountry(card) {
   }
   return null;
 }
+
 async function extractSponsored(card) {
   try {
     const t = await card.evaluate((n) => n.innerText || "");
@@ -297,7 +316,9 @@ async function extractSponsored(card) {
     return false;
   }
 }
+
 async function extractPriceFromCard(card) {
+  // meta
   try {
     const meta = await card.$('meta[itemprop="price"]');
     if (meta) {
@@ -309,11 +330,13 @@ async function extractPriceFromCard(card) {
     }
   } catch {}
 
+  // on request
   try {
     const txt = await card.evaluate((n) => n.innerText || "");
     if (/prix sur demande|price on request/i.test(txt)) return { price: null, priceSource: "on-request" };
   } catch {}
 
+  // blocks
   const sels = ['[data-testid="price"]', '[class*="price"]', '[class*="Price"]'];
   for (const s of sels) {
     try {
@@ -323,6 +346,7 @@ async function extractPriceFromCard(card) {
       if (!t) continue;
       if (/frais de port|shipping/i.test(t) || /^\+/.test(t)) continue;
       if (/prix sur demande|price on request/i.test(t)) return { price: null, priceSource: "on-request" };
+
       const v = parseEuroFromText(t);
       if (v) return { price: v, priceSource: "card-dom" };
     } catch {}
@@ -331,7 +355,7 @@ async function extractPriceFromCard(card) {
   return { price: null, priceSource: "missing" };
 }
 
-// ================= DETAIL FALLBACK WITH RETRY =================
+// ================= DETAIL FALLBACK (optional) =================
 async function enrichFromDetail(br, item) {
   const attempt = async () => {
     const { context, page } = await createPage(br);
@@ -391,7 +415,7 @@ async function enrichFromDetail(br, item) {
         item.price = null;
         item.priceSource = "on-request";
       } else {
-        item.priceSource = "missing";
+        item.priceSource = "detail-missing";
       }
       return false;
     } finally {
@@ -419,51 +443,35 @@ async function enrichFromDetail(br, item) {
   }
 }
 
-// ================= SCRAPE ONE PAGE (MAIN STRICT + FAST FILTER) =================
+// ================= SCRAPE ONE PAGE (fixed) =================
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
 
   try {
     console.log("[SCRAPE] goto:", pageUrl);
 
-    // IMPORTANT: commit évite les blocages sur domcontentloaded
-    await page.goto(pageUrl, {
-      waitUntil: "commit",
-      timeout: CONFIG.pageTimeout,
-    });
-
+    await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.pageTimeout });
     await acceptCookies(page);
     await simulateHumanBehavior(page);
 
-    // Sélecteurs permissifs (on filtre après)
     const mainSel = 'main a[href*="--id"]';
     const anySel = 'a[href*="--id"]';
 
     let selectorUsed = mainSel;
-
-    // 1) Attente ATTACHED (PAS visible)
     try {
-      await page.waitForSelector(mainSel, {
-        timeout: CONFIG.selectorTimeout,
-        state: "attached",
-      });
+      await page.waitForSelector(mainSel, { timeout: CONFIG.selectorTimeout, state: "attached" });
     } catch {
       selectorUsed = anySel;
       try {
-        await page.waitForSelector(anySel, {
-          timeout: CONFIG.selectorTimeout,
-          state: "attached",
-        });
+        await page.waitForSelector(anySel, { timeout: CONFIG.selectorTimeout, state: "attached" });
       } catch {
-        console.log("[SCRAPE] Aucun lien trouvé (page vide ou bloquée)");
+        console.log("[SCRAPE] Aucun lien trouvé");
         return { expectedCount: 0, items: [] };
       }
     }
 
-    // 2) Lecture du nombre attendu (best effort)
     const expectedCount = await getExpectedCount(page);
 
-    // 3) Collecte en UNE PASSE (rapide, pas de roundtrip Playwright)
     const links = await page.$$eval(selectorUsed, (as) =>
       as
         .map((a) => ({
@@ -473,28 +481,22 @@ async function scrapeOnePage(br, pageUrl) {
         .filter((x) => x.href && x.href.includes("--id"))
     );
 
-    // 4) Si fallback global, on préfère les liens dans <main>
     let filtered = links;
     if (selectorUsed === anySel && links.some((x) => x.inMain)) {
       filtered = links.filter((x) => x.inMain);
     }
 
-    // 5) Filtrage STRICT: uniquement les annonces Chrono24
     filtered = filtered.filter((x) => x.href.includes(".htm"));
 
     if (filtered.length === 0) {
-      console.log("[SCRAPE] Liens trouvés mais aucun valide après filtrage");
+      console.log("[SCRAPE] Aucun lien valide après filtrage");
       return { expectedCount, items: [] };
     }
 
-    // 6) Construction des cards
     const byId = new Map();
 
     for (const { href } of filtered) {
-      const fullUrl = href.startsWith("http")
-        ? href
-        : `https://www.chrono24.fr${href}`;
-
+      const fullUrl = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
       const id = extractListingId(fullUrl);
       if (!id || byId.has(id)) continue;
 
@@ -502,26 +504,16 @@ async function scrapeOnePage(br, pageUrl) {
       try {
         const a = await page.$(`a[href="${href}"]`);
         if (a) {
-          cardHandle = await a.evaluateHandle(
-            (el) => el.closest("article") || el.closest("li") || el.closest("div")
-          );
+          cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
         }
       } catch {}
 
-      if (!cardHandle) {
-        cardHandle = await page.evaluateHandle(() => document.body);
-      }
+      if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
 
-      byId.set(id, {
-        id,
-        url: fullUrl,
-        card: cardHandle,
-      });
+      byId.set(id, { id, url: fullUrl, card: cardHandle });
     }
 
-    // 7) Extraction des données
     const items = [];
-
     for (const v of byId.values()) {
       const title = (await extractTitle(v.card)) || `Listing ${v.id}`;
       const country = await extractCountry(v.card);
@@ -541,19 +533,19 @@ async function scrapeOnePage(br, pageUrl) {
 
     console.log(`[SCRAPE] Page OK — ${items.length} annonces`);
     return { expectedCount, items };
-
   } finally {
     await context.close().catch(() => {});
   }
 }
 
-// ================= MAIN SCRAPE FUNCTION =================
+// ================= MAIN SCRAPER =================
 async function scrapeChrono24(url, opts) {
   const pageSize = Number(opts.pageSize || 120);
   const maxPages = Number(opts.maxPages || 50);
   const noCache = !!opts.noCache;
+  const detailMode = String(opts.detailMode || "none"); // "none" | "missing"
 
-  const cacheKey = JSON.stringify({ url, pageSize, maxPages });
+  const cacheKey = JSON.stringify({ url, pageSize, maxPages, detailMode });
   const cached = getCached(cacheKey, noCache);
   if (cached) return { ...cached, fromCache: true };
 
@@ -581,26 +573,30 @@ async function scrapeChrono24(url, opts) {
 
   const items = [...all.values()];
 
-  const missingPrices = items.filter((it) => it.priceSource === "missing");
-  if (missingPrices.length > 0) {
-    const limit = createLimiter(CONFIG.detailConcurrency);
-    await Promise.all(
-      missingPrices.map((it) =>
-        limit(async () => {
-          await enrichFromDetail(br, it);
-          await sleep(randomDelay(400, 900));
-        })
-      )
-    );
+  // Optional detail enrichment (prevents Lovable 3min timeout when detailMode="none")
+  if (detailMode === "missing") {
+    const missing = items.filter((it) => it.priceSource === "missing");
+    if (missing.length > 0) {
+      const limit = createLimiter(CONFIG.detailConcurrency);
+      await Promise.all(
+        missing.map((it) =>
+          limit(async () => {
+            await enrichFromDetail(br, it);
+            await sleep(randomDelay(400, 900));
+          })
+        )
+      );
+    }
   }
 
+  // Fail-fast exact count if expectedCount present
   if (typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
     const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
     e.meta = { expectedCount, got: items.length, pagesScraped, pageSize, sample: items.slice(0, 5) };
     throw e;
   }
 
-  const result = { expectedCount, count: items.length, pageSize, pagesScraped, items };
+  const result = { expectedCount, count: items.length, pageSize, pagesScraped, detailMode, items };
   setCache(cacheKey, result);
   return result;
 }
@@ -615,17 +611,16 @@ app.get("/health", (req, res) =>
   })
 );
 
-// VERY IMPORTANT: log that requests are arriving
 app.post("/api/scrape", async (req, res) => {
   console.log("[HIT] /api/scrape", new Date().toISOString());
   console.log("[BODY]", req.body);
 
   try {
-    const { url, pageSize, maxPages, noCache } = req.body || {};
+    const { url, pageSize, maxPages, noCache, detailMode } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
       return res.status(400).json({ error: "Invalid Chrono24 URL" });
     }
-    const out = await scrapeChrono24(url, { pageSize, maxPages, noCache });
+    const out = await scrapeChrono24(url, { pageSize, maxPages, noCache, detailMode });
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: e.message, meta: e.meta || null });
@@ -637,11 +632,9 @@ app.post("/api/cache/clear", (req, res) => {
   res.json({ ok: true });
 });
 
-// DEBUG: Ping chrono24 homepage
 app.get("/api/ping-chrono24", async (req, res) => {
   let br;
   let context;
-
   try {
     br = await getBrowser(true);
     const pageObj = await createPage(br, false);
@@ -660,7 +653,6 @@ app.get("/api/ping-chrono24", async (req, res) => {
   }
 });
 
-// DEBUG: Fetch any URL and return title + html head (proves what is returned)
 app.get("/api/debug-goto", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
