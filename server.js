@@ -6,356 +6,415 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ============ CONFIGURATION ============
+const PORT = process.env.PORT || 3001;
+
+// ============ CONFIG ============
 const CONFIG = {
-  USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  LOCALE: 'fr-FR',
-  ACCEPT_LANGUAGE: 'fr-FR,fr;q=0.9,en;q=0.8',
-  CACHE_TTL_MS: 10 * 60 * 1000,
-  DETAIL_CONCURRENCY: 4,
-  VIEWPORT: { width: 1920, height: 1080 },
+  userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  locale: 'fr-FR',
+  cacheTTL: 10 * 60 * 1000,
+  detailConcurrency: 3,
+  viewport: { width: 1920, height: 1080 },
 };
 
-// ============ CACHE MÉMOIRE ============
+// ============ CACHE ============
 const cache = new Map();
-
-function getCached(url) {
+const getCached = (url) => {
   const entry = cache.get(url);
-  if (entry && Date.now() - entry.timestamp < CONFIG.CACHE_TTL_MS) {
-    return entry.data;
-  }
-  cache.delete(url);
+  if (entry && Date.now() - entry.timestamp < CONFIG.cacheTTL) return entry.data;
   return null;
-}
+};
+const setCache = (url, data) => cache.set(url, { data, timestamp: Date.now() });
 
-function setCache(url, data) {
-  cache.set(url, { data, timestamp: Date.now() });
-}
-
-// ============ BROWSER INSTANCE ============
+// ============ BROWSER ============
 let browserInstance = null;
-
-async function getBrowser() {
+const getBrowser = async () => {
   if (!browserInstance) {
-    browserInstance = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    browserInstance = await chromium.launch({ headless: true });
   }
   return browserInstance;
-}
+};
 
-async function createPage(browser) {
+const createPage = async (browser) => {
   const context = await browser.newContext({
-    locale: CONFIG.LOCALE,
-    userAgent: CONFIG.USER_AGENT,
-    viewport: CONFIG.VIEWPORT,
-    extraHTTPHeaders: { 'Accept-Language': CONFIG.ACCEPT_LANGUAGE },
+    locale: CONFIG.locale,
+    userAgent: CONFIG.userAgent,
+    viewport: CONFIG.viewport,
   });
-
   const page = await context.newPage();
-
   await page.route('**/*', (route) => {
-    const resourceType = route.request().resourceType();
-    if (['image', 'font', 'media', 'stylesheet'].includes(resourceType)) {
+    const type = route.request().resourceType();
+    if (['image', 'font', 'media'].includes(type)) {
       route.abort();
     } else {
       route.continue();
     }
   });
+  return { context, page };
+};
 
-  return { page, context };
-}
-
-// ============ COOKIE HANDLER ============
-async function acceptCookies(page) {
-  try {
-    const cookieSelectors = [
-      'button[data-testid="uc-accept-all-button"]',
-      '#onetrust-accept-btn-handler',
-      'button:has-text("Tout accepter")',
-      'button:has-text("Accepter")',
-      'button:has-text("Accept all")',
-      '.js-cookie-accept',
-    ];
-
-    for (const selector of cookieSelectors) {
-      try {
-        const btn = await page.$(selector);
-        if (btn) {
-          await btn.click();
-          await page.waitForTimeout(1000);
-          return true;
-        }
-      } catch (e) {}
-    }
-    return false;
-  } catch (err) {
-    return false;
+// ============ COOKIE CONSENT ============
+const acceptCookies = async (page) => {
+  const selectors = [
+    'button#onetrust-accept-btn-handler',
+    'button[data-testid="uc-accept-all-button"]',
+    'button.accept-cookies',
+    'button[id*="accept"]',
+    'button[class*="accept"]',
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        await page.waitForTimeout(500);
+        return;
+      }
+    } catch {}
   }
-}
+};
 
 // ============ EXTRACT EXPECTED COUNT ============
-async function extractExpectedCount(page) {
-  try {
-    const countSelectors = ['.js-search-result-count', '[data-testid="search-result-count"]', '.search-result-header__count'];
-
-    for (const selector of countSelectors) {
-      const el = await page.$(selector);
+const extractExpectedCount = async (page) => {
+  const selectors = [
+    '.js-result-count',
+    '[data-testid="result-count"]',
+    '.result-count',
+    'h1.h3',
+    '.search-result-header span',
+  ];
+  
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
       if (el) {
         const text = await el.textContent();
-        const match = text.match(/(\d[\d\s,.]*)/);
-        if (match) {
-          return parseInt(match[1].replace(/[\s,.]/g, ''), 10);
-        }
+        const match = text.match(/(\d[\d\s]*)/);
+        if (match) return parseInt(match[1].replace(/\s/g, ''), 10);
       }
-    }
-
-    const title = await page.title();
-    const titleMatch = title.match(/(\d+)\s*(montres?|offres?|résultats?|watches?)/i);
-    if (titleMatch) return parseInt(titleMatch[1], 10);
-
-    return null;
-  } catch (err) {
-    return null;
+    } catch {}
   }
-}
+  
+  // Fallback: check page title
+  const title = await page.title();
+  const match = title.match(/(\d+)\s*(montres|résultats|watches)/i);
+  if (match) return parseInt(match[1], 10);
+  
+  return null;
+};
 
-// ============ EXTRACT ID FROM URL ============
-function extractListingId(url) {
-  const match = url.match(/--id(\d+)\.htm/i);
+// ============ EXTRACT LISTING ID ============
+const extractListingId = (url) => {
+  const match = url.match(/--id(\d+)\.htm/);
   return match ? match[1] : null;
-}
+};
 
 // ============ EXTRACT PRICE FROM CARD ============
-async function extractPriceFromCard(card) {
+const extractPriceFromCard = async (card) => {
+  // Priority 1: meta itemprop="price"
   try {
-    const metaPrice = await card.$('meta[itemprop="price"]');
-    if (metaPrice) {
-      const content = await metaPrice.getAttribute('content');
+    const meta = await card.$('meta[itemprop="price"]');
+    if (meta) {
+      const content = await meta.getAttribute('content');
       if (content) {
-        const price = parseFloat(content);
+        const price = parseInt(content.replace(/[^\d]/g, ''), 10);
         if (price > 0) return { price, source: 'meta-itemprop' };
       }
     }
+  } catch {}
 
-    const priceSelectors = ['.article-price-container .text-bold', '[data-testid="price"]', '.article-price', '.text-price-primary'];
-
-    for (const selector of priceSelectors) {
-      const priceEl = await card.$(selector);
-      if (priceEl) {
-        const text = await priceEl.textContent();
-        const cleanText = text.replace(/[^\d.,\s]/g, '').trim();
-        const normalized = cleanText.replace(/[\s.]/g, '').replace(',', '.');
-        const price = parseFloat(normalized);
-        if (price > 500 && price < 50000000) return { price, source: `selector:${selector}` };
+  // Priority 2: data-price attribute
+  try {
+    const priceEl = await card.$('[data-price]');
+    if (priceEl) {
+      const dataPrice = await priceEl.getAttribute('data-price');
+      if (dataPrice) {
+        const price = parseInt(dataPrice.replace(/[^\d]/g, ''), 10);
+        if (price > 0) return { price, source: 'data-price' };
       }
     }
+  } catch {}
 
-    return null;
-  } catch (err) {
-    return null;
+  // Priority 3: Price text selectors
+  const priceSelectors = [
+    '.article-price-container strong',
+    '.article-price strong',
+    '.price-container .price',
+    '.article-item-price',
+    '[class*="price"] strong',
+    '.text-price',
+    'strong.text-xl',
+  ];
+
+  for (const sel of priceSelectors) {
+    try {
+      const el = await card.$(sel);
+      if (el) {
+        const text = await el.textContent();
+        if (text && !text.toLowerCase().includes('demande') && !text.toLowerCase().includes('request')) {
+          const cleaned = text.replace(/[^\d]/g, '');
+          const price = parseInt(cleaned, 10);
+          if (price > 100) return { price, source: sel };
+        }
+      }
+    } catch {}
   }
-}
+
+  return { price: null, source: null };
+};
+
+// ============ EXTRACT TITLE FROM CARD ============
+const extractTitleFromCard = async (card) => {
+  const titleSelectors = [
+    'a[href*="--id"] h3',
+    '.article-title',
+    'h3.h4',
+    '.article-item-title',
+    'a[href*="chrono24"] h3',
+    'h3',
+  ];
+
+  for (const sel of titleSelectors) {
+    try {
+      const el = await card.$(sel);
+      if (el) {
+        const text = await el.textContent();
+        if (text && text.trim().length > 5) {
+          return text.trim();
+        }
+      }
+    } catch {}
+  }
+  return null;
+};
+
+// ============ EXTRACT COUNTRY FROM CARD ============
+const extractCountryFromCard = async (card) => {
+  const countrySelectors = [
+    '.article-dealer-country',
+    '.seller-country',
+    '[class*="country"]',
+    '.text-muted:has-text("France")',
+    '.text-muted:has-text("Germany")',
+    '.article-merchant-location',
+  ];
+
+  for (const sel of countrySelectors) {
+    try {
+      const el = await card.$(sel);
+      if (el) {
+        const text = await el.textContent();
+        if (text && text.trim().length > 1) {
+          return text.trim();
+        }
+      }
+    } catch {}
+  }
+
+  // Fallback: Look for flag images or country codes
+  try {
+    const flagImg = await card.$('img[src*="flags"], img[alt*="flag"]');
+    if (flagImg) {
+      const alt = await flagImg.getAttribute('alt');
+      if (alt) return alt.replace('flag', '').trim();
+    }
+  } catch {}
+
+  return null;
+};
 
 // ============ EXTRACT LISTING FROM CARD ============
-async function extractListingFromCard(card, index) {
+const extractListingFromCard = async (card, index) => {
   try {
-    const linkEl = await card.$('a[href*="--id"]');
-    if (!linkEl) return null;
+    // Get URL
+    const link = await card.$('a[href*="--id"]');
+    if (!link) return null;
 
-    const href = await linkEl.getAttribute('href');
+    const href = await link.getAttribute('href');
     if (!href) return null;
 
-    const id = extractListingId(href);
+    const url = href.startsWith('http') ? href : `https://www.chrono24.fr${href}`;
+    const id = extractListingId(url);
     if (!id) return null;
 
-    const fullUrl = href.startsWith('http') ? href : `https://www.chrono24.fr${href}`;
+    // Get title
+    const title = await extractTitleFromCard(card) || `Listing ${id}`;
 
-    let title = '';
-    const titleEl = await card.$('.article-title, [data-testid="article-title"], h3, h2');
-    if (titleEl) title = (await titleEl.textContent()).trim();
+    // Get price
+    const { price, source: priceSource } = await extractPriceFromCard(card);
 
-    const priceData = await extractPriceFromCard(card);
+    // Get country
+    const country = await extractCountryFromCard(card);
 
-    let country = null;
-    const countryEl = await card.$('[data-testid="seller-country"], .seller-country, .merchant-country');
-    if (countryEl) {
-      const countryText = await countryEl.textContent();
-      const countryMatch = countryText.match(/([A-Z]{2})/);
-      if (countryMatch) country = countryMatch[1];
-    }
-
+    // Check if sponsored
     let isSponsored = false;
-    const sponsoredEl = await card.$('[data-testid="promoted"], .promoted-label, .sponsored');
-    if (sponsoredEl) isSponsored = true;
-
-    return { id, url: fullUrl, title: title || `Listing ${id}`, price: priceData?.price || null, priceSource: priceData?.source || null, country, isSponsored };
-  } catch (err) {
-    return null;
-  }
-}
-
-// ============ DETAIL PAGE FALLBACK ============
-async function extractPriceFromDetailPage(browser, url) {
-  let context = null;
-  try {
-    const result = await createPage(browser);
-    context = result.context;
-    const page = result.page;
-
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await acceptCookies(page);
-    await page.waitForTimeout(1000);
-
-    const metaPrice = await page.$('meta[itemprop="price"]');
-    if (metaPrice) {
-      const content = await metaPrice.getAttribute('content');
-      if (content) {
-        const price = parseFloat(content);
-        if (price > 0) { await context.close(); return { price, source: 'detail-meta' }; }
-      }
-    }
-
-    const priceSelectors = ['.js-price-shipping-country-price', '[data-testid="price"]', '.price-value'];
-    for (const selector of priceSelectors) {
-      const priceEl = await page.$(selector);
-      if (priceEl) {
-        const text = await priceEl.textContent();
-        const normalized = text.replace(/[^\d.,\s]/g, '').replace(/[\s.]/g, '').replace(',', '.');
-        const price = parseFloat(normalized);
-        if (price > 500 && price < 50000000) { await context.close(); return { price, source: `detail:${selector}` }; }
-      }
-    }
-
-    await context.close();
-    return null;
-  } catch (err) {
-    if (context) await context.close();
-    return null;
-  }
-}
-
-// ============ SCRAPE WITH CONCURRENCY ============
-async function scrapeDetailPagesWithConcurrency(browser, listings, concurrency = CONFIG.DETAIL_CONCURRENCY) {
-  const needDetailFetch = listings.filter(l => l.price === null);
-  if (needDetailFetch.length === 0) return listings;
-
-  const results = [...listings];
-  const queue = [...needDetailFetch];
-
-  async function processNext() {
-    if (queue.length === 0) return;
-    const item = queue.shift();
     try {
-      const priceData = await extractPriceFromDetailPage(browser, item.url);
-      if (priceData) {
-        const idx = results.findIndex(r => r.id === item.id);
-        if (idx >= 0) { results[idx].price = priceData.price; results[idx].priceSource = priceData.source; }
-      }
-    } catch (err) {}
-    await processNext();
+      const sponsoredEl = await card.$('[class*="sponsor"], [class*="premium"], [data-sponsored]');
+      isSponsored = !!sponsoredEl;
+    } catch {}
+
+    return { id, url, title, price, priceSource, country, isSponsored };
+  } catch (error) {
+    console.error(`Error extracting card ${index}:`, error.message);
+    return null;
   }
+};
 
-  const workers = [];
-  for (let i = 0; i < Math.min(concurrency, queue.length); i++) workers.push(processNext());
-  await Promise.all(workers);
-
-  return results;
-}
-
-// ============ MAIN SCRAPE ============
-async function scrapeChrono24(url) {
+// ============ MAIN SCRAPE FUNCTION ============
+const scrapeChrono24 = async (url) => {
+  // Check cache
   const cached = getCached(url);
-  if (cached) return cached;
+  if (cached) {
+    console.log('Returning cached result');
+    return cached;
+  }
 
   const browser = await getBrowser();
-  let context = null;
+  const { context, page } = await createPage(browser);
 
   try {
-    const result = await createPage(browser);
-    context = result.context;
-    const page = result.page;
-
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-    await acceptCookies(page);
+    console.log(`Navigating to: ${url}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2000);
 
+    // Accept cookies
+    await acceptCookies(page);
+
+    // Get expected count
     const expectedCount = await extractExpectedCount(page);
+    console.log(`Expected count: ${expectedCount}`);
 
-    let previousHeight = 0, scrollAttempts = 0;
-    while (scrollAttempts < 20) {
+    // Scroll to load all items
+    let previousHeight = 0;
+    let scrollAttempts = 0;
+    const maxScrolls = 20;
+
+    while (scrollAttempts < maxScrolls) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1000);
+      
       const currentHeight = await page.evaluate(() => document.body.scrollHeight);
-      if (currentHeight === previousHeight) break;
+      if (currentHeight === previousHeight) {
+        scrollAttempts++;
+        if (scrollAttempts >= 3) break;
+      } else {
+        scrollAttempts = 0;
+      }
       previousHeight = currentHeight;
-      scrollAttempts++;
     }
 
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(500);
+    // Find all article cards
+    const cardSelectors = [
+      'article.article-item',
+      '.article-item-container',
+      '[data-testid="article-item"]',
+      '.js-article-item',
+      'article[class*="article"]',
+    ];
 
-    const cardSelectors = ['article[data-testid="article-card"]', '.article-item-container', '.search-result-item', '.article-card'];
     let cards = [];
-    for (const selector of cardSelectors) {
-      cards = await page.$$(selector);
-      if (cards.length > 0) break;
+    for (const sel of cardSelectors) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) {
+        console.log(`Found ${cards.length} cards with selector: ${sel}`);
+        break;
+      }
     }
 
-    if (cards.length === 0) { await context.close(); return { expectedCount, count: 0, items: [], error: 'No cards found' }; }
+    if (cards.length === 0) {
+      // Fallback: find all links to listings
+      console.log('No cards found, trying link-based extraction');
+      const links = await page.$$('a[href*="--id"][href$=".htm"]');
+      console.log(`Found ${links.length} listing links`);
+      
+      const items = [];
+      const seenIds = new Set();
+      
+      for (const link of links) {
+        try {
+          const href = await link.getAttribute('href');
+          const url = href.startsWith('http') ? href : `https://www.chrono24.fr${href}`;
+          const id = extractListingId(url);
+          
+          if (id && !seenIds.has(id)) {
+            seenIds.add(id);
+            items.push({
+              id,
+              url,
+              title: `Listing ${id}`,
+              price: null,
+              priceSource: null,
+              country: null,
+              isSponsored: false,
+            });
+          }
+        } catch {}
+      }
+      
+      const result = { expectedCount, count: items.length, items };
+      setCache(url, result);
+      return result;
+    }
 
-    const rawListings = [];
+    // Extract data from each card
+    const rawItems = [];
     for (let i = 0; i < cards.length; i++) {
-      const listing = await extractListingFromCard(cards[i], i);
-      if (listing) rawListings.push(listing);
+      const item = await extractListingFromCard(cards[i], i);
+      if (item) rawItems.push(item);
     }
 
-    // Dedup by ID
+    // Deduplicate by ID
     const seenIds = new Set();
-    const deduped = rawListings.filter(l => { if (seenIds.has(l.id)) return false; seenIds.add(l.id); return true; });
+    const items = rawItems.filter((item) => {
+      if (seenIds.has(item.id)) return false;
+      seenIds.add(item.id);
+      return true;
+    });
 
-    const withPrices = await scrapeDetailPagesWithConcurrency(browser, deduped);
+    console.log(`Extracted ${items.length} unique items`);
+
+    const result = { expectedCount, count: items.length, items };
+    setCache(url, result);
+    return result;
+  } finally {
     await context.close();
-
-    const response = { expectedCount, count: withPrices.length, items: withPrices };
-    if (expectedCount !== null && withPrices.length !== expectedCount) response.warning = `Count mismatch: expected ${expectedCount}, got ${withPrices.length}`;
-
-    setCache(url, response);
-    return response;
-  } catch (err) {
-    if (context) await context.close();
-    throw err;
   }
-}
+};
 
-// ============ API ============
+// ============ API ENDPOINTS ============
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.post('/api/scrape', async (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'URL required' });
-  if (!url.includes('chrono24.')) return res.status(400).json({ error: 'Invalid Chrono24 URL' });
+
+  if (!url || !url.includes('chrono24')) {
+    return res.status(400).json({ error: 'Invalid Chrono24 URL' });
+  }
 
   try {
+    console.log(`\n========== SCRAPE REQUEST ==========`);
+    console.log(`URL: ${url}`);
+    
     const result = await scrapeChrono24(url);
-
-    if (result.expectedCount !== null && result.count > 0) {
-      const diff = Math.abs(result.expectedCount - result.count);
-      if (diff / result.expectedCount > 0.1 && diff > 5) {
-        return res.status(500).json({ error: 'Count mismatch', expectedCount: result.expectedCount, got: result.count, sample: result.items.slice(0, 5) });
-      }
-    }
-
+    
+    console.log(`Result: ${result.count} items`);
     res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error('Scrape error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.post('/api/cache/clear', (req, res) => { cache.clear(); res.json({ status: 'cleared' }); });
+app.post('/api/cache/clear', (req, res) => {
+  cache.clear();
+  res.json({ success: true, message: 'Cache cleared' });
+});
 
-const PORT = process.env.PORT || 3001;
+// ============ START SERVER ============
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-process.on('SIGTERM', async () => { if (browserInstance) await browserInstance.close(); process.exit(0); });
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  if (browserInstance) await browserInstance.close();
+  process.exit(0);
+});
