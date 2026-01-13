@@ -422,69 +422,126 @@ async function enrichFromDetail(br, item) {
 // ================= SCRAPE ONE PAGE (MAIN STRICT + FAST FILTER) =================
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
+
   try {
-    await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.pageTimeout });
+    console.log("[SCRAPE] goto:", pageUrl);
+
+    // IMPORTANT: commit évite les blocages sur domcontentloaded
+    await page.goto(pageUrl, {
+      waitUntil: "commit",
+      timeout: CONFIG.pageTimeout,
+    });
+
     await acceptCookies(page);
     await simulateHumanBehavior(page);
 
-    const mainSel = 'main a[href*="--id"][href$=".htm"]';
-    const anySel = 'a[href*="--id"][href$=".htm"]';
+    // Sélecteurs permissifs (on filtre après)
+    const mainSel = 'main a[href*="--id"]';
+    const anySel = 'a[href*="--id"]';
 
     let selectorUsed = mainSel;
+
+    // 1) Attente ATTACHED (PAS visible)
     try {
-      await page.waitForSelector(mainSel, { timeout: CONFIG.selectorTimeout });
+      await page.waitForSelector(mainSel, {
+        timeout: CONFIG.selectorTimeout,
+        state: "attached",
+      });
     } catch {
       selectorUsed = anySel;
       try {
-        await page.waitForSelector(anySel, { timeout: CONFIG.selectorTimeout });
+        await page.waitForSelector(anySel, {
+          timeout: CONFIG.selectorTimeout,
+          state: "attached",
+        });
       } catch {
+        console.log("[SCRAPE] Aucun lien trouvé (page vide ou bloquée)");
         return { expectedCount: 0, items: [] };
       }
     }
 
+    // 2) Lecture du nombre attendu (best effort)
     const expectedCount = await getExpectedCount(page);
 
+    // 3) Collecte en UNE PASSE (rapide, pas de roundtrip Playwright)
     const links = await page.$$eval(selectorUsed, (as) =>
       as
-        .map((a) => ({ href: a.getAttribute("href") || "", inMain: !!a.closest("main") }))
-        .filter((x) => x.href)
+        .map((a) => ({
+          href: a.getAttribute("href") || "",
+          inMain: !!a.closest("main"),
+        }))
+        .filter((x) => x.href && x.href.includes("--id"))
     );
 
-    const filtered =
-      selectorUsed === mainSel
-        ? links
-        : links.some((x) => x.inMain)
-        ? links.filter((x) => x.inMain)
-        : links;
+    // 4) Si fallback global, on préfère les liens dans <main>
+    let filtered = links;
+    if (selectorUsed === anySel && links.some((x) => x.inMain)) {
+      filtered = links.filter((x) => x.inMain);
+    }
 
+    // 5) Filtrage STRICT: uniquement les annonces Chrono24
+    filtered = filtered.filter((x) => x.href.includes(".htm"));
+
+    if (filtered.length === 0) {
+      console.log("[SCRAPE] Liens trouvés mais aucun valide après filtrage");
+      return { expectedCount, items: [] };
+    }
+
+    // 6) Construction des cards
     const byId = new Map();
 
     for (const { href } of filtered) {
-      const full = href.startsWith("http") ? href : `https://www.chrono24.fr${href}`;
-      const id = extractListingId(full);
+      const fullUrl = href.startsWith("http")
+        ? href
+        : `https://www.chrono24.fr${href}`;
+
+      const id = extractListingId(fullUrl);
       if (!id || byId.has(id)) continue;
 
       let cardHandle = null;
       try {
         const a = await page.$(`a[href="${href}"]`);
-        if (a) cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
+        if (a) {
+          cardHandle = await a.evaluateHandle(
+            (el) => el.closest("article") || el.closest("li") || el.closest("div")
+          );
+        }
       } catch {}
 
-      if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
+      if (!cardHandle) {
+        cardHandle = await page.evaluateHandle(() => document.body);
+      }
 
-      byId.set(id, { id, url: full, card: cardHandle });
+      byId.set(id, {
+        id,
+        url: fullUrl,
+        card: cardHandle,
+      });
     }
 
+    // 7) Extraction des données
     const items = [];
+
     for (const v of byId.values()) {
       const title = (await extractTitle(v.card)) || `Listing ${v.id}`;
       const country = await extractCountry(v.card);
       const isSponsored = await extractSponsored(v.card);
       const pr = await extractPriceFromCard(v.card);
-      items.push({ id: v.id, url: v.url, title, country, isSponsored, price: pr.price, priceSource: pr.priceSource });
+
+      items.push({
+        id: v.id,
+        url: v.url,
+        title,
+        country,
+        isSponsored,
+        price: pr.price,
+        priceSource: pr.priceSource,
+      });
     }
 
+    console.log(`[SCRAPE] Page OK — ${items.length} annonces`);
     return { expectedCount, items };
+
   } finally {
     await context.close().catch(() => {});
   }
