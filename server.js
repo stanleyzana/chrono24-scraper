@@ -1,12 +1,13 @@
 /**
- * Chrono24 Scraper (Render + Lovable friendly)
- * - Proxy config kept (PROXY_URL + FREE_PROXIES) but safe-trimmed
- * - Page scraping: fast + reliable (waitUntil:"commit", waitForSelector state:"attached")
- * - Link-first strict in MAIN + global fallback filtered in-main
- * - Pagination supported (page + pageSize)
- * - detailMode: "none" (fast) | "missing" (fetch detail only if price missing)
- * - Logs requests and key steps
- * - Debug endpoints: /api/ping-chrono24, /api/debug-goto
+ * Chrono24 Scraper (Render + Lovable friendly) — UPDATED
+ * ✅ Proxy config kept (PROXY_URL + FREE_PROXIES), safe-trimmed
+ * ✅ Page scraping: waitUntil:"commit", waitForSelector state:"attached"
+ * ✅ Link-first strict in MAIN + fallback global filtered in-main
+ * ✅ Pagination supported (page + pageSize)
+ * ✅ PARTIAL MODE: if maxPages < totalPages => returns 200 with partial:true (NO fail-fast)
+ * ✅ Fail-fast exact ONLY when scrape is complete (pagesScraped === totalPages)
+ * ✅ detailMode: "none" (default) | "missing" (enrich detail only for missing prices)
+ * ✅ Debug endpoints: /health, /api/ping-chrono24, /api/debug-goto
  */
 
 const express = require("express");
@@ -59,20 +60,16 @@ function randomDelay(min = 500, max = 2000) {
   return Math.floor(Math.random() * (max - min) + min);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function getRandomUserAgent() {
   return CONFIG.userAgents[Math.floor(Math.random() * CONFIG.userAgents.length)];
 }
-
 function normalize(s) {
   return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
 }
-
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
-
 function parseEuroFromText(s) {
   const t = normalize(s);
   const patterns = [
@@ -89,7 +86,6 @@ function parseEuroFromText(s) {
   }
   return null;
 }
-
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   for (const [k, v] of Object.entries(params)) u.searchParams.set(k, String(v));
@@ -222,7 +218,6 @@ async function createPage(br, stealth = true) {
     });
   }
 
-  // block heavy resources
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -294,7 +289,6 @@ async function extractTitle(card) {
   }
   return null;
 }
-
 async function extractCountry(card) {
   const sels = ['[class*="country"]', '[class*="location"]', '[class*="seller"]'];
   for (const s of sels) {
@@ -307,7 +301,6 @@ async function extractCountry(card) {
   }
   return null;
 }
-
 async function extractSponsored(card) {
   try {
     const t = await card.evaluate((n) => n.innerText || "");
@@ -316,9 +309,7 @@ async function extractSponsored(card) {
     return false;
   }
 }
-
 async function extractPriceFromCard(card) {
-  // meta
   try {
     const meta = await card.$('meta[itemprop="price"]');
     if (meta) {
@@ -330,13 +321,11 @@ async function extractPriceFromCard(card) {
     }
   } catch {}
 
-  // on request
   try {
     const txt = await card.evaluate((n) => n.innerText || "");
     if (/prix sur demande|price on request/i.test(txt)) return { price: null, priceSource: "on-request" };
   } catch {}
 
-  // blocks
   const sels = ['[data-testid="price"]', '[class*="price"]', '[class*="Price"]'];
   for (const s of sels) {
     try {
@@ -346,7 +335,6 @@ async function extractPriceFromCard(card) {
       if (!t) continue;
       if (/frais de port|shipping/i.test(t) || /^\+/.test(t)) continue;
       if (/prix sur demande|price on request/i.test(t)) return { price: null, priceSource: "on-request" };
-
       const v = parseEuroFromText(t);
       if (v) return { price: v, priceSource: "card-dom" };
     } catch {}
@@ -355,7 +343,7 @@ async function extractPriceFromCard(card) {
   return { price: null, priceSource: "missing" };
 }
 
-// ================= DETAIL FALLBACK (optional) =================
+// ================= DETAIL ENRICH (optional) =================
 async function enrichFromDetail(br, item) {
   const attempt = async () => {
     const { context, page } = await createPage(br);
@@ -443,7 +431,7 @@ async function enrichFromDetail(br, item) {
   }
 }
 
-// ================= SCRAPE ONE PAGE (fixed) =================
+// ================= SCRAPE ONE PAGE =================
 async function scrapeOnePage(br, pageUrl) {
   const { context, page } = await createPage(br);
 
@@ -474,10 +462,7 @@ async function scrapeOnePage(br, pageUrl) {
 
     const links = await page.$$eval(selectorUsed, (as) =>
       as
-        .map((a) => ({
-          href: a.getAttribute("href") || "",
-          inMain: !!a.closest("main"),
-        }))
+        .map((a) => ({ href: a.getAttribute("href") || "", inMain: !!a.closest("main") }))
         .filter((x) => x.href && x.href.includes("--id"))
     );
 
@@ -503,9 +488,7 @@ async function scrapeOnePage(br, pageUrl) {
       let cardHandle = null;
       try {
         const a = await page.$(`a[href="${href}"]`);
-        if (a) {
-          cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
-        }
+        if (a) cardHandle = await a.evaluateHandle((el) => el.closest("article") || el.closest("li") || el.closest("div"));
       } catch {}
 
       if (!cardHandle) cardHandle = await page.evaluateHandle(() => document.body);
@@ -538,7 +521,7 @@ async function scrapeOnePage(br, pageUrl) {
   }
 }
 
-// ================= MAIN SCRAPER =================
+// ================= MAIN SCRAPER (partial-safe) =================
 async function scrapeChrono24(url, opts) {
   const pageSize = Number(opts.pageSize || 120);
   const maxPages = Number(opts.maxPages || 50);
@@ -555,15 +538,15 @@ async function scrapeChrono24(url, opts) {
   const first = await scrapeOnePage(br, url1);
 
   const expectedCount = first.expectedCount;
-  const totalPages =
-    typeof expectedCount === "number" && expectedCount > 0
-      ? Math.min(maxPages, Math.ceil(expectedCount / pageSize))
-      : 1;
+  const computedTotalPages =
+    typeof expectedCount === "number" && expectedCount > 0 ? Math.ceil(expectedCount / pageSize) : 1;
+
+  const totalPagesToScrape = Math.min(maxPages, computedTotalPages);
 
   const all = new Map(first.items.map((x) => [x.id, x]));
   let pagesScraped = 1;
 
-  for (let p = 2; p <= totalPages; p++) {
+  for (let p = 2; p <= totalPagesToScrape; p++) {
     const pageUrl = withParams(url, { pageSize, page: p });
     const { items } = await scrapeOnePage(br, pageUrl);
     for (const it of items) all.set(it.id, it);
@@ -573,7 +556,6 @@ async function scrapeChrono24(url, opts) {
 
   const items = [...all.values()];
 
-  // Optional detail enrichment (prevents Lovable 3min timeout when detailMode="none")
   if (detailMode === "missing") {
     const missing = items.filter((it) => it.priceSource === "missing");
     if (missing.length > 0) {
@@ -589,14 +571,35 @@ async function scrapeChrono24(url, opts) {
     }
   }
 
-  // Fail-fast exact count if expectedCount present
-  if (typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
+  const isComplete = pagesScraped === computedTotalPages;
+
+  // Fail-fast ONLY if complete, else return partial
+  if (isComplete && typeof expectedCount === "number" && expectedCount > 0 && items.length !== expectedCount) {
     const e = new Error(`Count mismatch after pagination: expected ${expectedCount}, got ${items.length}`);
-    e.meta = { expectedCount, got: items.length, pagesScraped, pageSize, sample: items.slice(0, 5) };
+    e.meta = {
+      expectedCount,
+      got: items.length,
+      pagesScraped,
+      pageSize,
+      totalPages: computedTotalPages,
+      sample: items.slice(0, 5),
+    };
     throw e;
   }
 
-  const result = { expectedCount, count: items.length, pageSize, pagesScraped, detailMode, items };
+  const result = {
+    expectedCount,
+    count: items.length,
+    pageSize,
+    pagesScraped,
+    totalPages: computedTotalPages,
+    maxPages,
+    partial: !isComplete,
+    detailMode,
+    items,
+    warning: !isComplete ? `Partial scrape: scraped ${pagesScraped}/${computedTotalPages} pages` : null,
+  };
+
   setCache(cacheKey, result);
   return result;
 }
@@ -632,9 +635,11 @@ app.post("/api/cache/clear", (req, res) => {
   res.json({ ok: true });
 });
 
+// DEBUG: Ping chrono24 homepage
 app.get("/api/ping-chrono24", async (req, res) => {
   let br;
   let context;
+
   try {
     br = await getBrowser(true);
     const pageObj = await createPage(br, false);
@@ -653,6 +658,7 @@ app.get("/api/ping-chrono24", async (req, res) => {
   }
 });
 
+// DEBUG: Fetch any URL and return title + html head
 app.get("/api/debug-goto", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing ?url=" });
