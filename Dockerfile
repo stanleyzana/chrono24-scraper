@@ -1,8 +1,8 @@
-FROM mcr.microsoft.com/playwright:v1.48.0-jammy
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json ./
 
 RUN npm install
 
@@ -10,6 +10,6 @@ COPY . .
 
 ENV NODE_ENV=production
 
-EXPOSE 3001
+EXPOSE 10000
 
 CMD ["npm", "start"]
