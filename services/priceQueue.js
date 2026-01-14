@@ -1,18 +1,32 @@
 const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 
-// Connexion Redis pour BullMQ avec support TLS
-const connection = process.env.REDIS_URL 
-  ? new Redis(process.env.REDIS_URL, {
+// Connexion Redis pour BullMQ avec support TLS (lazy loading)
+let connection;
+
+function getConnection() {
+  if (!connection && process.env.REDIS_URL) {
+    connection = new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: null,
       enableReadyCheck: false,
       family: 6,
-    })
-  : new Redis();
+      lazyConnect: true,
+    });
+    
+    connection.on('error', (err) => {
+      console.error('❌ Erreur Redis:', err);
+    });
+    
+    connection.on('ready', () => {
+      console.log('✅ Redis connecté!');
+    });
+  }
+  return connection;
+}
 
 // Création de la queue
-const priceQueue = new Queue('price-scraping', { 
-  connection 
+const priceQueue = new Queue('price-scraping', {
+  connection: getConnection(),
 });
 
 priceQueue.on('error', (err) => {
