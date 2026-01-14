@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
-const { priceQueue } = require('./services/priceQueue');
+const priceQueue = require('./services/priceQueue');
 const redis = require('./services/redis');
 
 const app = express();
