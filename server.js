@@ -257,7 +257,39 @@ async function scrapePriceForListing(listingUrl) {
     await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await acceptCookies(page);
     await simulateHuman(page);
-
+    
+    // Priorité 1: JSON-LD (le plus fiable)
+    const priceFromJsonLd = await page.evaluate(() => {
+      try {
+        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+        for (const script of scripts) {
+          const data = JSON.parse(script.textContent);
+          if (data.offers?.price) {
+            return parseInt(data.offers.price.toString().replace(/[^0-9]/g, ''), 10);
+          }
+          if (data['@type'] === 'Product' && data.offers?.[0]?.price) {
+            return parseInt(data.offers[0].price.toString().replace(/[^0-9]/g, ''), 10);
+          }
+        }
+      } catch (e) {}
+      return null;
+    });
+    
+    if (priceFromJsonLd) return priceFromJsonLd;
+    
+    // Priorité 2: Meta tags
+    const priceFromMeta = await page.evaluate(() => {
+      const metaPrice = document.querySelector('meta[itemprop="price"]');
+      if (metaPrice) {
+        const price = metaPrice.getAttribute('content');
+        return price ? parseInt(price.replace(/[^0-9]/g, ''), 10) : null;
+      }
+      return null;
+    });
+    
+    if (priceFromMeta) return priceFromMeta;
+    
+    // Priorité 3: Sélecteurs CSS (fallback)
     const priceText = await page.evaluate(() => {
       const selectors = [
         '.js-price-shipping-country[data-price]',
@@ -273,9 +305,9 @@ async function scrapePriceForListing(listingUrl) {
       }
       return null;
     });
-
+    
     if (!priceText) return null;
-
+    
     const cleaned = priceText.replace(/[^0-9]/g, '');
     return cleaned ? parseInt(cleaned, 10) : null;
   } catch (error) {
