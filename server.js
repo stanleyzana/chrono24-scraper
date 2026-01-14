@@ -162,7 +162,7 @@ async function simulateHuman(page) {
 async function getExpectedCount(page) {
   try {
     const text = await page.evaluate(() => document.body?.innerText || "");
-    const m = text.match(/(\d+)\s+(?:annonces?|rÃ©sultats?|montres?|watches?|listings?)/i);
+    const m = text.match(/(\d+)\s+(?:annonces?|resultats?|montres?|watches?|listings?)/i);
     return m ? Number(m[1]) : null;
   } catch {
     return null;
