@@ -1,32 +1,19 @@
 const { Queue } = require('bullmq');
-const IORedis = require('ioredis');
+const Redis = require('ioredis');
 
-// Connexion IORedis pour BullMQ
-const connection = new IORedis(process.env.UPSTASH_REDIS_REST_URL, {
+// Connexion Redis pour BullMQ
+const connection = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: null,
-  enableOfflineQueue: false,
-  tls: {
-    rejectUnauthorized: false
-  }
+  enableReadyCheck: false,
 });
 
-// Créer la queue pour les prix
+// Création de la queue
 const priceQueue = new Queue('price-scraping', { 
-  connection,
-  defaultJobOptions: {
-    attempts: 2,
-    backoff: {
-      type: 'exponential',
-      delay: 2000
-    },
-    removeOnComplete: {
-      age: 3600, // garde 1h
-      count: 100
-    },
-    removeOnFail: {
-      age: 7200
-    }
-  }
+  connection 
+});
+
+priceQueue.on('error', (err) => {
+  console.error('❌ Erreur Queue:', err);
 });
 
 console.log('✅ Queue "price-scraping" créée');
