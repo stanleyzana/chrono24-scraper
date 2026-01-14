@@ -381,24 +381,19 @@ app.post("/api/scrape", async (req, res) => {
     // Lancer le traitement en background
     (async () => {
       const results = [];
-      for (let i = 0; i < listOut.items.length; i++) {
-        const listing = listOut.items[i];
-        const price = await scrapePriceForListing(listing.url);
-        results.push({ ...listing, price });
-
-        // Update progress
-        await redis.set(jobId, JSON.stringify({
-          status: 'active',
-          listings: listOut.items,
-          total: listOut.items.length,
-          processed: i + 1,
-          results,
-          updatedAt: new Date().toISOString()
-        }), { ex: 3600 });
-
-        await sleep(randInt(500, 1000));
-      }
-
+      // Lancer le traitement en background
+(async () => {
+  const results = [];
+  for (let i = 0; i < listOut.items.length; i++) {
+    const listing = listOut.items[i];
+    const price = await scrapePriceForListing(listing.url);
+    results.push({ ...listing, price });
+    
+    // Update progress
+    await redis.set(jobId, JSON.stringify({...}), { ex: 3600 });
+    
+    await sleep(randInt(500, 1000));
+  }
       // Mark as completed
       await redis.set(jobId, JSON.stringify({
         status: 'completed',
