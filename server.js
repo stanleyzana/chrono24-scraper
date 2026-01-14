@@ -1,17 +1,25 @@
 require('dotenv').config();
+
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
-const priceQueue = require('./services/priceQueue');
-const redis = require('./services/redis');
+const { Redis } = require("@upstash/redis");
 
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3001;
-
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
+
+// âœ… Redis avec Upstash REST API (pas de problÃ¨me DNS)
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+console.log("âœ… Redis REST configurÃ©");
 
 const CONFIG = {
   viewport: { width: 1920, height: 1080 },
@@ -106,7 +114,6 @@ async function createPage(br, stealth = true) {
     ignoreHTTPSErrors: true,
   });
   const page = await context.newPage();
-  
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -114,7 +121,6 @@ async function createPage(br, stealth = true) {
     else if (t === "image" && !url.includes("chrono24")) route.abort();
     else route.continue();
   });
-  
   if (stealth) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
@@ -156,7 +162,7 @@ async function simulateHuman(page) {
 async function getExpectedCount(page) {
   try {
     const text = await page.evaluate(() => document.body?.innerText || "");
-    const m = text.match(/(\d+)\s+(?:annonces?|résultats?|montres?|watches?|listings?)/i);
+    const m = text.match(/(\d+)\s+(?:annonces?|rÃ©sultats?|montres?|watches?|listings?)/i);
     return m ? Number(m[1]) : null;
   } catch {
     return null;
@@ -171,7 +177,6 @@ async function scrapeListPage(pageUrl) {
     await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.listGotoTimeoutMs });
     await acceptCookies(page);
     await simulateHuman(page);
-
     const mainSel = 'main a[href*="--id"]';
     const anySel = 'a[href*="--id"]';
     let selectorUsed = mainSel;
@@ -181,7 +186,6 @@ async function scrapeListPage(pageUrl) {
       selectorUsed = anySel;
       await page.waitForSelector(anySel, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
     }
-
     const expectedCount = await getExpectedCount(page);
     const links = await page.$$eval(selectorUsed, (as) =>
       as
@@ -192,12 +196,10 @@ async function scrapeListPage(pageUrl) {
         }))
         .filter((x) => x.href && x.href.includes("--id"))
     );
-
     let filtered = links;
     if (selectorUsed === anySel && links.some((x) => x.inMain)) {
       filtered = links.filter((x) => x.inMain);
     }
-
     filtered = filtered.filter((x) => x.href.includes(".htm"));
     const byId = new Map();
     for (const l of filtered) {
@@ -210,7 +212,6 @@ async function scrapeListPage(pageUrl) {
         title: l.text && l.text.length > 3 ? l.text : `Listing ${id}`,
       });
     }
-
     return { expectedCount, items: [...byId.values()] };
   } finally {
     await context.close().catch(() => {});
@@ -224,10 +225,8 @@ async function scrapeList(url, pageSize, maxPages) {
   const computedTotalPages =
     typeof expectedCount === "number" && expectedCount > 0 ? Math.ceil(expectedCount / pageSize) : 1;
   const totalPagesToScrape = Math.min(maxPages, computedTotalPages);
-
   const all = new Map(first.items.map((x) => [x.id, x]));
   let pagesScraped = 1;
-
   for (let p = 2; p <= totalPagesToScrape; p++) {
     const pageUrl = withParams(url, { pageSize, page: p });
     const next = await scrapeListPage(pageUrl);
@@ -235,7 +234,6 @@ async function scrapeList(url, pageSize, maxPages) {
     pagesScraped = p;
     await sleep(randInt(700, 1400));
   }
-
   return {
     scrapedAt: new Date().toISOString(),
     expectedCount,
@@ -248,6 +246,44 @@ async function scrapeList(url, pageSize, maxPages) {
     warning: pagesScraped !== computedTotalPages ? `Partial: ${pagesScraped}/${computedTotalPages} pages` : null,
     items: [...all.values()],
   };
+}
+
+// âœ… Fonction de scraping de prix (similaire Ã  avant)
+async function scrapePriceForListing(listingUrl) {
+  const br = await getBrowser(false);
+  const { context, page } = await createPage(br, true);
+  try {
+    console.log("[PRICE] goto", listingUrl);
+    await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await acceptCookies(page);
+    await simulateHuman(page);
+
+    const priceText = await page.evaluate(() => {
+      const selectors = [
+        '.js-price-shipping-country[data-price]',
+        '[data-testid="price"]',
+        '.m-price',
+        '.js-price'
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          return el.getAttribute('data-price') || el.textContent;
+        }
+      }
+      return null;
+    });
+
+    if (!priceText) return null;
+
+    const cleaned = priceText.replace(/[^0-9]/g, '');
+    return cleaned ? parseInt(cleaned, 10) : null;
+  } catch (error) {
+    console.error('[PRICE ERROR]', listingUrl, error.message);
+    return null;
+  } finally {
+    await context.close().catch(() => {});
+  }
 }
 
 // ================= ROUTES =================
@@ -267,17 +303,16 @@ app.get("/health", async (req, res) => {
     res.status(500).json({
       status: "error",
       redis: "disconnected",
-      error: error.message
+      error: error.message,
     });
   }
 });
 
-// 🚀 NOUVEAU : Scrape rapide avec job async
+// ðŸš€ Scrape avec rÃ©cupÃ©ration de prix en background
 app.post("/api/scrape", async (req, res) => {
   console.log("[HIT] /api/scrape", new Date().toISOString(), req.body);
   try {
-    const { url, pageSize = 30, maxPages = 1, noCache = false } = req.body || {};
-
+    const { url, pageSize = 30, maxPages = 1, noCache = false, withPrices = false } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
       return res.status(400).json({ error: "Invalid Chrono24 URL" });
     }
@@ -290,45 +325,97 @@ app.post("/api/scrape", async (req, res) => {
 
     const listOut = await scrapeList(url, Number(pageSize), Number(maxPages));
 
-    const job = await priceQueue.add('scrape-prices', {
+    // Si pas de prix demandÃ©s, retourner directement
+    if (!withPrices) {
+      const response = {
+        ...listOut,
+        message: `${listOut.count} annonces rÃ©cupÃ©rÃ©es`,
+      };
+      cacheSet(key, response);
+      return res.json(response);
+    }
+
+    // Sinon, crÃ©er un job et stocker dans Redis
+    const jobId = `job:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
+    await redis.set(jobId, JSON.stringify({
+      status: 'pending',
       listings: listOut.items,
-      query: url
+      total: listOut.items.length,
+      processed: 0,
+      results: [],
+      createdAt: new Date().toISOString()
+    }), { ex: 3600 }); // 1h TTL
+
+    // Lancer le traitement en background
+    (async () => {
+      const results = [];
+      for (let i = 0; i < listOut.items.length; i++) {
+        const listing = listOut.items[i];
+        const price = await scrapePriceForListing(listing.url);
+        results.push({ ...listing, price });
+
+        // Update progress
+        await redis.set(jobId, JSON.stringify({
+          status: 'active',
+          listings: listOut.items,
+          total: listOut.items.length,
+          processed: i + 1,
+          results,
+          updatedAt: new Date().toISOString()
+        }), { ex: 3600 });
+
+        await sleep(randInt(500, 1000));
+      }
+
+      // Mark as completed
+      await redis.set(jobId, JSON.stringify({
+        status: 'completed',
+        total: listOut.items.length,
+        processed: listOut.items.length,
+        results,
+        completedAt: new Date().toISOString()
+      }), { ex: 3600 });
+    })().catch(err => {
+      console.error('[JOB ERROR]', jobId, err);
+      redis.set(jobId, JSON.stringify({
+        status: 'failed',
+        error: err.message,
+        failedAt: new Date().toISOString()
+      }), { ex: 3600 });
     });
 
     const response = {
       ...listOut,
-      jobId: job.id,
+      jobId,
       pricesStatus: 'pending',
-      message: `${listOut.count} annonces récupérées. Prix en cours de récupération...`,
-      statusUrl: `/api/jobs/${job.id}/status`,
-      resultsUrl: `/api/jobs/${job.id}/results`
+      message: `${listOut.count} annonces rÃ©cupÃ©rÃ©es. Prix en cours de rÃ©cupÃ©ration...`,
+      statusUrl: `/api/jobs/${jobId}/status`,
+      resultsUrl: `/api/jobs/${jobId}/results`
     };
 
-    cacheSet(key, response);
     res.json(response);
-
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// 🚀 NOUVEAU : Vérifier le statut d'un job
+// VÃ©rifier le statut d'un job
 app.get("/api/jobs/:jobId/status", async (req, res) => {
   try {
     const { jobId } = req.params;
-    const job = await priceQueue.getJob(jobId);
+    const data = await redis.get(jobId);
 
-    if (!job) {
-      return res.status(404).json({ error: 'Job non trouvé' });
+    if (!data) {
+      return res.status(404).json({ error: 'Job non trouvÃ©' });
     }
 
-    const state = await job.getState();
-    const progress = job.progress || 0;
-
+    const job = JSON.parse(data);
     res.json({
       jobId,
-      state,
-      progress,
+      status: job.status,
+      progress: job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0,
+      processed: job.processed,
+      total: job.total,
       timestamp: new Date().toISOString()
     });
   } catch (e) {
@@ -336,40 +423,39 @@ app.get("/api/jobs/:jobId/status", async (req, res) => {
   }
 });
 
-// 🚀 NOUVEAU : Récupérer les résultats
+// RÃ©cupÃ©rer les rÃ©sultats
 app.get("/api/jobs/:jobId/results", async (req, res) => {
   try {
     const { jobId } = req.params;
-    const job = await priceQueue.getJob(jobId);
+    const data = await redis.get(jobId);
 
-    if (!job) {
-      return res.status(404).json({ error: 'Job non trouvé' });
+    if (!data) {
+      return res.status(404).json({ error: 'Job non trouvÃ©' });
     }
 
-    const state = await job.getState();
+    const job = JSON.parse(data);
 
-    if (state !== 'completed') {
+    if (job.status !== 'completed') {
       return res.json({
-        status: state,
-        message: state === 'active' ? 'Traitement en cours...' : 'Pas encore terminé',
-        progress: job.progress || 0
+        status: job.status,
+        message: job.status === 'active' ? 'Traitement en cours...' : 'Pas encore terminÃ©',
+        progress: job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0
       });
     }
 
-    const results = job.returnvalue;
     res.json({
       status: 'completed',
       jobId,
-      count: results.length,
-      prices: results,
-      completedAt: new Date().toISOString()
+      count: job.results.length,
+      prices: job.results,
+      completedAt: job.completedAt
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Ancien endpoint (compatibilité)
+// Ancien endpoint (compatibilitÃ©)
 app.post("/api/scrape-list", async (req, res) => {
   console.log("[HIT] /api/scrape-list", new Date().toISOString(), req.body);
   try {
@@ -392,12 +478,11 @@ app.post("/api/scrape-list", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`ðŸš€ Server running on port ${PORT}`));
 
 process.on("SIGTERM", async () => {
   try {
     if (browserInstance) await browserInstance.close().catch(() => {});
-    await priceQueue.close();
   } finally {
     process.exit(0);
   }
