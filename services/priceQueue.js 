@@ -31,4 +31,4 @@ const priceQueue = new Queue('price-scraping', {
 
 console.log('✅ Queue "price-scraping" créée');
 
-module.exports = { priceQueue, connection };
+module.exports = priceQueue;
