@@ -1,3 +1,22 @@
+/**
+ * Chrono24 Scraper — FINAL (1 deploy, then stop touching it)
+ *
+ * Goals achieved:
+ * ✅ Correct titles (from listing card, not pagination links)
+ * ✅ Robust price extraction (JSON-LD array/@graph/offers + meta itemprop + OG product meta + DOM fallback)
+ * ✅ Async job UX (POST /api/scrape returns immediately with jobId)
+ * ✅ Reliable Redis parsing (safeJsonParse fixes "Unexpected token o")
+ * ✅ Lightweight status updates during job (no huge payload spam to Redis)
+ * ✅ Render port binding + stable browser singleton
+ *
+ * Endpoints:
+ * - GET  /health
+ * - POST /api/scrape        { url, pageSize, maxPages, noCache, withPrices }
+ * - GET  /api/jobs/:jobId/status
+ * - GET  /api/jobs/:jobId/results
+ * - POST /api/scrape-list   (list only)
+ */
+
 require("dotenv").config();
 
 const express = require("express");
@@ -12,7 +31,7 @@ app.use(express.json({ limit: "2mb" }));
 const PORT = Number(process.env.PORT || 10000);
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
-// Redis via Upstash REST API
+// Upstash Redis (REST)
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
@@ -31,7 +50,8 @@ const CONFIG = {
   ],
   listGotoTimeoutMs: 90000,
   listSelectorTimeoutMs: 60000,
-  detailGotoTimeoutMs: 60000,
+  detailGotoTimeoutMs: 30000,
+  priceConcurrency: 3,
 };
 
 const cache = new Map();
@@ -50,15 +70,12 @@ function cacheSet(key, data) {
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
-
 function normalize(s) {
   return (s || "").replace(/[\u00A0\u202F]/g, " ").replace(/\s+/g, " ").trim();
 }
-
 function safeJsonParse(value) {
   if (value == null) return null;
   if (typeof value === "object") return value;
@@ -69,12 +86,10 @@ function safeJsonParse(value) {
     return null;
   }
 }
-
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
 }
-
 function withParams(inputUrl, params) {
   const u = new URL(inputUrl);
   Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, String(v)));
@@ -127,10 +142,11 @@ async function createPage(br, stealth = true) {
 
   const page = await context.newPage();
 
+  // Speed: block heavy resources
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
-    if (["media", "font"].includes(t)) route.abort();
+    if (["media", "font", "stylesheet"].includes(t)) route.abort();
     else if (t === "image" && !url.includes("chrono24")) route.abort();
     else route.continue();
   });
@@ -154,13 +170,13 @@ async function acceptCookies(page) {
     "button:has-text(\"J'accepte\")",
     'button:has-text("Accept")',
   ];
-  await page.waitForTimeout(randInt(250, 650));
+  await page.waitForTimeout(randInt(200, 500));
   for (const s of sels) {
     try {
       const b = await page.$(s);
       if (b) {
         await b.click().catch(() => {});
-        await page.waitForTimeout(randInt(150, 400));
+        await page.waitForTimeout(randInt(150, 350));
         return;
       }
     } catch {}
@@ -170,7 +186,7 @@ async function acceptCookies(page) {
 async function simulateHuman(page) {
   try {
     await page.evaluate(() => window.scrollTo(0, Math.random() * 500));
-    await page.waitForTimeout(randInt(150, 400));
+    await page.waitForTimeout(randInt(120, 260));
   } catch {}
 }
 
@@ -184,9 +200,13 @@ async function getExpectedCount(page) {
   }
 }
 
+/**
+ * LIST PAGE: extract listing links AND titles from the card (not link text)
+ */
 async function scrapeListPage(pageUrl) {
   const br = await getBrowser(false);
   const { context, page } = await createPage(br, true);
+
   try {
     console.log("[LIST] goto", pageUrl);
     await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.listGotoTimeoutMs });
@@ -208,30 +228,34 @@ async function scrapeListPage(pageUrl) {
 
     const links = await page.$$eval(selectorUsed, (as) =>
       as
-        .map((a) => ({
-          href: a.getAttribute("href") || "",
-          inMain: !!a.closest("main"),
-          text: (a.textContent || "").trim(),
-        }))
-        .filter((x) => x.href && x.href.includes("--id"))
+        .map((a) => {
+          const href = a.getAttribute("href") || "";
+          const inMain = !!a.closest("main");
+
+          const card = a.closest("article") || a.closest("li") || a.closest("div");
+          let title = "";
+          if (card) {
+            const h = card.querySelector("h3, h2, [class*='title'], [data-testid*='title']");
+            title = (h?.textContent || "").trim();
+          }
+          return { href, inMain, title };
+        })
+        .filter((x) => x.href && x.href.includes("--id") && x.href.includes(".htm"))
     );
 
     let filtered = links;
     if (selectorUsed === anySel && links.some((x) => x.inMain)) {
       filtered = links.filter((x) => x.inMain);
     }
-    filtered = filtered.filter((x) => x.href.includes(".htm"));
 
     const byId = new Map();
     for (const l of filtered) {
       const fullUrl = l.href.startsWith("http") ? l.href : `https://www.chrono24.fr${l.href}`;
       const id = extractListingId(fullUrl);
       if (!id || byId.has(id)) continue;
-      byId.set(id, {
-        id,
-        url: fullUrl,
-        title: l.text && l.text.length > 3 ? l.text : `Listing ${id}`,
-      });
+
+      const t = normalize(l.title);
+      byId.set(id, { id, url: fullUrl, title: t && t.length > 3 ? t : `Listing ${id}` });
     }
 
     return { expectedCount, items: [...byId.values()] };
@@ -258,7 +282,7 @@ async function scrapeList(url, pageSize, maxPages) {
     const next = await scrapeListPage(pageUrl);
     for (const it of next.items) all.set(it.id, it);
     pagesScraped = p;
-    await sleep(randInt(700, 1400));
+    await sleep(randInt(500, 900));
   }
 
   return {
@@ -275,7 +299,9 @@ async function scrapeList(url, pageSize, maxPages) {
   };
 }
 
-// -------------------- Price scraping (detail page) --------------------
+/**
+ * DETAIL PRICE: robust JSON-LD + meta + fallback
+ */
 async function scrapePriceForListing(listingUrl) {
   const br = await getBrowser(false);
   const { context, page } = await createPage(br, true);
@@ -283,13 +309,11 @@ async function scrapePriceForListing(listingUrl) {
   try {
     console.log("[PRICE] goto", listingUrl);
 
-    // ✅ micro-maj: commit (plus rapide/robuste que domcontentloaded)
     await page.goto(listingUrl, { waitUntil: "commit", timeout: CONFIG.detailGotoTimeoutMs });
-
     await acceptCookies(page);
     await simulateHuman(page);
 
-    // JSON-LD (robuste: array + @graph + offers object/array)
+    // JSON-LD robust
     const jsonLdResult = await page.evaluate(() => {
       function pickPriceFromObj(obj) {
         if (!obj) return null;
@@ -358,14 +382,13 @@ async function scrapePriceForListing(listingUrl) {
     });
     if (jsonLdResult && jsonLdResult.price) return jsonLdResult;
 
-    // Meta tags (inclut OpenGraph product:price:amount)
+    // Meta: itemprop + OG product:price:amount
     const metaResult = await page.evaluate(() => {
       const selectors = [
         'meta[itemprop="price"]',
         'meta[property="product:price:amount"]',
         'meta[name="product:price:amount"]',
       ];
-
       for (const sel of selectors) {
         const el = document.querySelector(sel);
         if (!el) continue;
@@ -378,7 +401,7 @@ async function scrapePriceForListing(listingUrl) {
     });
     if (metaResult && metaResult.price) return metaResult;
 
-    // Fallback CSS
+    // Fallback DOM
     const fallbackResult = await page.evaluate(() => {
       const selectors = [
         '.js-price-shipping-country[data-price]',
@@ -437,7 +460,7 @@ app.post("/api/scrape", async (req, res) => {
       return res.status(400).json({ error: "Invalid Chrono24 URL" });
     }
 
-    const key = JSON.stringify({ url, pageSize, maxPages });
+    const key = JSON.stringify({ url, pageSize, maxPages, withPrices });
     if (!noCache) {
       const cached = cacheGet(key);
       if (cached) return res.json({ ...cached, fromCache: true });
@@ -464,8 +487,9 @@ app.post("/api/scrape", async (req, res) => {
       { ex: 3600 }
     );
 
+    // background worker
     (async () => {
-      const CONCURRENCY = 3;
+      const CONCURRENCY = CONFIG.priceConcurrency;
       const results = [];
 
       async function processBatch(batch) {
@@ -483,6 +507,7 @@ app.post("/api/scrape", async (req, res) => {
         const batchResults = await processBatch(batch);
         results.push(...batchResults);
 
+        // lightweight status update (no huge payload)
         await redis.set(
           jobId,
           JSON.stringify({
@@ -606,9 +631,9 @@ app.post("/api/scrape-list", async (req, res) => {
 
     const out = await scrapeList(url, Number(pageSize), Number(maxPages));
     cacheSet(key, out);
-    res.json(out);
+    return res.json(out);
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
