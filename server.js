@@ -13,13 +13,13 @@ app.use(express.json({ limit: "2mb" }));
 const PORT = process.env.PORT || 3001;
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
-// âœ… Redis avec Upstash REST API (pas de problÃ¨me DNS)
+// Redis via Upstash REST API
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-console.log("âœ… Redis REST configurÃ©");
+console.log("✅ Redis REST configuré");
 
 const CONFIG = {
   viewport: { width: 1920, height: 1080 },
@@ -56,8 +56,9 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+// normalize UTF-8 correct
 function normalize(s) {
-  return (s || "").replace(/\u00A0|\u202F/g, " ").replace(/\s+/g, " ").trim();
+  return (s || "").replace(/[\u00A0\u202F]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function extractListingId(url) {
@@ -248,7 +249,7 @@ async function scrapeList(url, pageSize, maxPages) {
   };
 }
 
-// âœ… Fonction de scraping de prix (similaire Ã  avant)
+// Scraping prix robuste avec priceSource
 async function scrapePriceForListing(listingUrl) {
   const br = await getBrowser(false);
   const { context, page } = await createPage(br, true);
@@ -257,69 +258,83 @@ async function scrapePriceForListing(listingUrl) {
     await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await acceptCookies(page);
     await simulateHuman(page);
-    
-    // Priorité 1: JSON-LD (le plus fiable)
-    const priceFromJsonLd = await page.evaluate(() => {
+
+    // JSON-LD
+    const jsonLdResult = await page.evaluate(() => {
       try {
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
-          const data = JSON.parse(script.textContent);
+          const data = JSON.parse(script.textContent || "{}");
           if (data.offers?.price) {
-            return parseInt(data.offers.price.toString().replace(/[^0-9]/g, ''), 10);
+            return {
+              price: parseInt(data.offers.price.toString().replace(/[^0-9]/g, ""), 10),
+              priceSource: "jsonld",
+            };
           }
-          if (data['@type'] === 'Product' && data.offers?.[0]?.price) {
-            return parseInt(data.offers[0].price.toString().replace(/[^0-9]/g, ''), 10);
+          if (data["@type"] === "Product" && Array.isArray(data.offers) && data.offers[0]?.price) {
+            return {
+              price: parseInt(data.offers[0].price.toString().replace(/[^0-9]/g, ""), 10),
+              priceSource: "jsonld",
+            };
           }
         }
       } catch (e) {}
       return null;
     });
-    
-    if (priceFromJsonLd) return priceFromJsonLd;
-    
-    // Priorité 2: Meta tags
-    const priceFromMeta = await page.evaluate(() => {
+    if (jsonLdResult && jsonLdResult.price) return jsonLdResult;
+
+    // Meta tags
+    const metaResult = await page.evaluate(() => {
       const metaPrice = document.querySelector('meta[itemprop="price"]');
       if (metaPrice) {
-        const price = metaPrice.getAttribute('content');
-        return price ? parseInt(price.replace(/[^0-9]/g, ''), 10) : null;
-      }
-      return null;
-    });
-    
-    if (priceFromMeta) return priceFromMeta;
-    
-    // Priorité 3: Sélecteurs CSS (fallback)
-    const priceText = await page.evaluate(() => {
-      const selectors = [
-        '.js-price-shipping-country[data-price]',
-        '[data-testid="price"]',
-        '.m-price',
-        '.js-price'
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          return el.getAttribute('data-price') || el.textContent;
+        const price = metaPrice.getAttribute("content");
+        if (price) {
+          return {
+            price: parseInt(price.replace(/[^0-9]/g, ""), 10),
+            priceSource: "meta",
+          };
         }
       }
       return null;
     });
-    
-    if (!priceText) return null;
-    
-    const cleaned = priceText.replace(/[^0-9]/g, '');
-    return cleaned ? parseInt(cleaned, 10) : null;
+    if (metaResult && metaResult.price) return metaResult;
+
+    // Fallback CSS
+    const fallbackResult = await page.evaluate(() => {
+      const selectors = [
+        '.js-price-shipping-country[data-price]',
+        '[data-testid="price"]',
+        ".m-price",
+        ".js-price",
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const raw = el.getAttribute("data-price") || el.textContent || "";
+          const cleaned = raw.replace(/[^0-9]/g, "");
+          if (cleaned) {
+            return {
+              price: parseInt(cleaned, 10),
+              priceSource: "fallback",
+            };
+          }
+        }
+      }
+      return null;
+    });
+
+    if (fallbackResult && fallbackResult.price) return fallbackResult;
+
+    return { price: null, priceSource: "none" };
   } catch (error) {
-    console.error('[PRICE ERROR]', listingUrl, error.message);
-    return null;
+    console.error("[PRICE ERROR]", listingUrl, error.message);
+    return { price: null, priceSource: "error" };
   } finally {
     await context.close().catch(() => {});
   }
 }
 
-// ================= ROUTES =================
-
+// ROUTES
 app.get("/", (req, res) => res.send("ok"));
 
 app.get("/health", async (req, res) => {
@@ -340,7 +355,7 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// ðŸš€ Scrape avec rÃ©cupÃ©ration de prix en background
+// Scrape avec job async
 app.post("/api/scrape", async (req, res) => {
   console.log("[HIT] /api/scrape", new Date().toISOString(), req.body);
   try {
@@ -357,67 +372,93 @@ app.post("/api/scrape", async (req, res) => {
 
     const listOut = await scrapeList(url, Number(pageSize), Number(maxPages));
 
-    // Si pas de prix demandÃ©s, retourner directement
     if (!withPrices) {
       const response = {
         ...listOut,
-        message: `${listOut.count} annonces rÃ©cupÃ©rÃ©es`,
+        message: `${listOut.count} annonces récupérées`,
       };
       cacheSet(key, response);
       return res.json(response);
     }
 
-    // Sinon, crÃ©er un job et stocker dans Redis
     const jobId = `job:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
-    await redis.set(jobId, JSON.stringify({
-      status: 'pending',
-      listings: listOut.items,
-      total: listOut.items.length,
-      processed: 0,
-      results: [],
-      createdAt: new Date().toISOString()
-    }), { ex: 3600 }); // 1h TTL
-
-    // Lancer le traitement en background
-    (async () => {
-      const results = [];
-      // Lancer le traitement en background
-(async () => {
-  const results = [];
-  for (let i = 0; i < listOut.items.length; i++) {
-    const listing = listOut.items[i];
-    const price = await scrapePriceForListing(listing.url);
-    results.push({ ...listing, price });
-    
-    // Update progress
-    await redis.set(jobId, JSON.stringify({...}), { ex: 3600 });
-    
-    await sleep(randInt(500, 1000));
-  }
-      // Mark as completed
-      await redis.set(jobId, JSON.stringify({
-        status: 'completed',
+    await redis.set(
+      jobId,
+      JSON.stringify({
+        status: "pending",
         total: listOut.items.length,
-        processed: listOut.items.length,
-        results,
-        completedAt: new Date().toISOString()
-      }), { ex: 3600 });
-    })().catch(err => {
-      console.error('[JOB ERROR]', jobId, err);
-      redis.set(jobId, JSON.stringify({
-        status: 'failed',
-        error: err.message,
-        failedAt: new Date().toISOString()
-      }), { ex: 3600 });
+        processed: 0,
+        createdAt: new Date().toISOString(),
+      }),
+      { ex: 3600 }
+    );
+
+    // Background worker avec concurrence et updates légers
+    (async () => {
+      const CONCURRENCY = 3;
+      const results = [];
+
+      async function processBatch(batch) {
+        const batchResults = await Promise.all(
+          batch.map(async (listing) => {
+            const { price, priceSource } = await scrapePriceForListing(listing.url);
+            return { ...listing, price, priceSource };
+          })
+        );
+        return batchResults;
+      }
+
+      for (let i = 0; i < listOut.items.length; i += CONCURRENCY) {
+        const batch = listOut.items.slice(i, i + CONCURRENCY);
+        const batchResults = await processBatch(batch);
+        results.push(...batchResults);
+
+        await redis.set(
+          jobId,
+          JSON.stringify({
+            status: "active",
+            total: listOut.items.length,
+            processed: results.length,
+            updatedAt: new Date().toISOString(),
+          }),
+          { ex: 3600 }
+        );
+
+        // petit sleep entre batches (pas par item)
+        await sleep(randInt(100, 250));
+      }
+
+      await redis.set(
+        jobId,
+        JSON.stringify({
+          status: "completed",
+          total: listOut.items.length,
+          processed: listOut.items.length,
+          results,
+          completedAt: new Date().toISOString(),
+        }),
+        { ex: 3600 }
+      );
+    })().catch((err) => {
+      console.error("[JOB ERROR]", jobId, err);
+      redis.set(
+        jobId,
+        JSON.stringify({
+          status: "failed",
+          error: err.message,
+          failedAt: new Date().toISOString(),
+        }),
+        { ex: 3600 }
+      );
     });
 
     const response = {
       ...listOut,
       jobId,
-      pricesStatus: 'pending',
-      message: `${listOut.count} annonces rÃ©cupÃ©rÃ©es. Prix en cours de rÃ©cupÃ©ration...`,
+      pricesStatus: "pending",
+      message: `${listOut.count} annonces récupérées. Prix en cours de récupération...`,
       statusUrl: `/api/jobs/${jobId}/status`,
-      resultsUrl: `/api/jobs/${jobId}/results`
+      resultsUrl: `/api/jobs/${jobId}/results`,
     };
 
     res.json(response);
@@ -426,14 +467,13 @@ app.post("/api/scrape", async (req, res) => {
   }
 });
 
-// VÃ©rifier le statut d'un job
 app.get("/api/jobs/:jobId/status", async (req, res) => {
   try {
     const { jobId } = req.params;
     const data = await redis.get(jobId);
 
     if (!data) {
-      return res.status(404).json({ error: 'Job non trouvÃ©' });
+      return res.status(404).json({ error: "Job non trouvé" });
     }
 
     const job = JSON.parse(data);
@@ -443,46 +483,45 @@ app.get("/api/jobs/:jobId/status", async (req, res) => {
       progress: job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0,
       processed: job.processed,
       total: job.total,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// RÃ©cupÃ©rer les rÃ©sultats
 app.get("/api/jobs/:jobId/results", async (req, res) => {
   try {
     const { jobId } = req.params;
     const data = await redis.get(jobId);
 
     if (!data) {
-      return res.status(404).json({ error: 'Job non trouvÃ©' });
+      return res.status(404).json({ error: "Job non trouvé" });
     }
 
     const job = JSON.parse(data);
 
-    if (job.status !== 'completed') {
+    if (job.status !== "completed") {
       return res.json({
         status: job.status,
-        message: job.status === 'active' ? 'Traitement en cours...' : 'Pas encore terminÃ©',
-        progress: job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0
+        message: job.status === "active" ? "Traitement en cours..." : "Pas encore terminé",
+        progress: job.total > 0 ? Math.round((job.processed / job.total) * 100) : 0,
       });
     }
 
     res.json({
-      status: 'completed',
+      status: "completed",
       jobId,
       count: job.results.length,
       prices: job.results,
-      completedAt: job.completedAt
+      completedAt: job.completedAt,
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Ancien endpoint (compatibilitÃ©)
+// Ancien endpoint (compat)
 app.post("/api/scrape-list", async (req, res) => {
   console.log("[HIT] /api/scrape-list", new Date().toISOString(), req.body);
   try {
@@ -505,7 +544,7 @@ app.post("/api/scrape-list", async (req, res) => {
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => console.log(`ðŸš€ Server running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT}`));
 
 process.on("SIGTERM", async () => {
   try {
