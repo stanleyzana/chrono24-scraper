@@ -31,7 +31,7 @@ const CONFIG = {
   ],
   listGotoTimeoutMs: 90000,
   listSelectorTimeoutMs: 60000,
-  detailGotoTimeoutMs: 60000, // used in price scrape
+  detailGotoTimeoutMs: 60000,
 };
 
 const cache = new Map();
@@ -55,12 +55,10 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// normalize UTF-8 correct
 function normalize(s) {
   return (s || "").replace(/[\u00A0\u202F]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// ✅ FIX: safe parse for Upstash Redis payloads (string OR object)
 function safeJsonParse(value) {
   if (value == null) return null;
   if (typeof value === "object") return value;
@@ -153,7 +151,7 @@ async function acceptCookies(page) {
     '[data-testid="uc-accept-all-button"]',
     'button:has-text("Tout accepter")',
     'button:has-text("Accepter")',
-    'button:has-text("J\'accepte")',
+    "button:has-text(\"J'accepte\")",
     'button:has-text("Accept")',
   ];
   await page.waitForTimeout(randInt(250, 650));
@@ -284,45 +282,97 @@ async function scrapePriceForListing(listingUrl) {
 
   try {
     console.log("[PRICE] goto", listingUrl);
-    await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.detailGotoTimeoutMs });
+
+    // ✅ micro-maj: commit (plus rapide/robuste que domcontentloaded)
+    await page.goto(listingUrl, { waitUntil: "commit", timeout: CONFIG.detailGotoTimeoutMs });
+
     await acceptCookies(page);
     await simulateHuman(page);
 
-    // JSON-LD
+    // JSON-LD (robuste: array + @graph + offers object/array)
     const jsonLdResult = await page.evaluate(() => {
+      function pickPriceFromObj(obj) {
+        if (!obj) return null;
+
+        const tryOffers = (off) => {
+          if (!off) return null;
+          if (off.price != null) {
+            const v = parseInt(String(off.price).replace(/[^0-9]/g, ""), 10);
+            if (v) return v;
+          }
+          if (off.lowPrice != null) {
+            const v = parseInt(String(off.lowPrice).replace(/[^0-9]/g, ""), 10);
+            if (v) return v;
+          }
+          return null;
+        };
+
+        const offers = obj.offers;
+        if (Array.isArray(offers)) {
+          for (const off of offers) {
+            const v = tryOffers(off);
+            if (v) return v;
+          }
+        } else {
+          const v = tryOffers(offers);
+          if (v) return v;
+        }
+
+        if (obj.price != null) {
+          const v = parseInt(String(obj.price).replace(/[^0-9]/g, ""), 10);
+          if (v) return v;
+        }
+
+        return null;
+      }
+
       try {
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-        for (const script of scripts) {
-          const data = JSON.parse(script.textContent || "{}");
-          if (data?.offers?.price) {
-            return {
-              price: parseInt(String(data.offers.price).replace(/[^0-9]/g, ""), 10),
-              priceSource: "jsonld",
-            };
+        for (const s of scripts) {
+          const raw = s.textContent || "";
+          if (!raw.trim()) continue;
+
+          let data;
+          try {
+            data = JSON.parse(raw);
+          } catch {
+            continue;
           }
-          if (data?.["@type"] === "Product" && Array.isArray(data?.offers) && data.offers[0]?.price) {
-            return {
-              price: parseInt(String(data.offers[0].price).replace(/[^0-9]/g, ""), 10),
-              priceSource: "jsonld",
-            };
+
+          const candidates = Array.isArray(data) ? data : [data];
+
+          for (const c of candidates) {
+            const direct = pickPriceFromObj(c);
+            if (direct) return { price: direct, priceSource: "jsonld" };
+
+            if (c && Array.isArray(c["@graph"])) {
+              for (const g of c["@graph"]) {
+                const v = pickPriceFromObj(g);
+                if (v) return { price: v, priceSource: "jsonld" };
+              }
+            }
           }
         }
-      } catch (e) {}
+      } catch {}
       return null;
     });
     if (jsonLdResult && jsonLdResult.price) return jsonLdResult;
 
-    // Meta tags
+    // Meta tags (inclut OpenGraph product:price:amount)
     const metaResult = await page.evaluate(() => {
-      const metaPrice = document.querySelector('meta[itemprop="price"]');
-      if (metaPrice) {
-        const price = metaPrice.getAttribute("content");
-        if (price) {
-          return {
-            price: parseInt(price.replace(/[^0-9]/g, ""), 10),
-            priceSource: "meta",
-          };
-        }
+      const selectors = [
+        'meta[itemprop="price"]',
+        'meta[property="product:price:amount"]',
+        'meta[name="product:price:amount"]',
+      ];
+
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const content = el.getAttribute("content");
+        if (!content) continue;
+        const v = parseInt(content.replace(/[^0-9]/g, ""), 10);
+        if (v) return { price: v, priceSource: "meta" };
       }
       return null;
     });
@@ -341,12 +391,7 @@ async function scrapePriceForListing(listingUrl) {
         if (el) {
           const raw = el.getAttribute("data-price") || el.textContent || "";
           const cleaned = String(raw).replace(/[^0-9]/g, "");
-          if (cleaned) {
-            return {
-              price: parseInt(cleaned, 10),
-              priceSource: "fallback",
-            };
-          }
+          if (cleaned) return { price: parseInt(cleaned, 10), priceSource: "fallback" };
         }
       }
       return null;
@@ -383,7 +428,6 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// Scrape with async job
 app.post("/api/scrape", async (req, res) => {
   console.log("[HIT] /api/scrape", new Date().toISOString(), req.body);
 
@@ -420,7 +464,6 @@ app.post("/api/scrape", async (req, res) => {
       { ex: 3600 }
     );
 
-    // Background worker (async)
     (async () => {
       const CONCURRENCY = 3;
       const results = [];
@@ -547,7 +590,6 @@ app.get("/api/jobs/:jobId/results", async (req, res) => {
   }
 });
 
-// Compatibility endpoint (list only)
 app.post("/api/scrape-list", async (req, res) => {
   console.log("[HIT] /api/scrape-list", new Date().toISOString(), req.body);
   try {
