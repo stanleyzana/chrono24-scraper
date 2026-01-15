@@ -1,4 +1,4 @@
-require('dotenv').config();
+require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
@@ -6,11 +6,10 @@ const { chromium } = require("playwright");
 const { Redis } = require("@upstash/redis");
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 10000);
 const PROXY_URL = (process.env.PROXY_URL || "").trim() || null;
 
 // Redis via Upstash REST API
@@ -32,6 +31,7 @@ const CONFIG = {
   ],
   listGotoTimeoutMs: 90000,
   listSelectorTimeoutMs: 60000,
+  detailGotoTimeoutMs: 60000, // used in price scrape
 };
 
 const cache = new Map();
@@ -43,7 +43,6 @@ function cacheGet(key) {
   if (Date.now() - e.ts > CACHE_TTL_MS) return null;
   return e.data;
 }
-
 function cacheSet(key, data) {
   cache.set(key, { ts: Date.now(), data });
 }
@@ -61,6 +60,18 @@ function normalize(s) {
   return (s || "").replace(/[\u00A0\u202F]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// ✅ FIX: safe parse for Upstash Redis payloads (string OR object)
+function safeJsonParse(value) {
+  if (value == null) return null;
+  if (typeof value === "object") return value;
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
 function extractListingId(url) {
   const m = (url || "").match(/--id(\d+)\.htm/i);
   return m ? m[1] : null;
@@ -72,6 +83,7 @@ function withParams(inputUrl, params) {
   return u.toString();
 }
 
+// -------------------- Playwright browser singleton --------------------
 let browserInstance = null;
 
 async function getBrowser(forceNew = false) {
@@ -114,7 +126,9 @@ async function createPage(br, stealth = true) {
     bypassCSP: true,
     ignoreHTTPSErrors: true,
   });
+
   const page = await context.newPage();
+
   await page.route("**/*", (route) => {
     const t = route.request().resourceType();
     const url = route.request().url();
@@ -122,12 +136,14 @@ async function createPage(br, stealth = true) {
     else if (t === "image" && !url.includes("chrono24")) route.abort();
     else route.continue();
   });
+
   if (stealth) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
       window.chrome = { runtime: {} };
     });
   }
+
   return { context, page };
 }
 
@@ -178,16 +194,20 @@ async function scrapeListPage(pageUrl) {
     await page.goto(pageUrl, { waitUntil: "commit", timeout: CONFIG.listGotoTimeoutMs });
     await acceptCookies(page);
     await simulateHuman(page);
+
     const mainSel = 'main a[href*="--id"]';
     const anySel = 'a[href*="--id"]';
     let selectorUsed = mainSel;
+
     try {
       await page.waitForSelector(mainSel, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
     } catch {
       selectorUsed = anySel;
       await page.waitForSelector(anySel, { timeout: CONFIG.listSelectorTimeoutMs, state: "attached" });
     }
+
     const expectedCount = await getExpectedCount(page);
+
     const links = await page.$$eval(selectorUsed, (as) =>
       as
         .map((a) => ({
@@ -197,11 +217,13 @@ async function scrapeListPage(pageUrl) {
         }))
         .filter((x) => x.href && x.href.includes("--id"))
     );
+
     let filtered = links;
     if (selectorUsed === anySel && links.some((x) => x.inMain)) {
       filtered = links.filter((x) => x.inMain);
     }
     filtered = filtered.filter((x) => x.href.includes(".htm"));
+
     const byId = new Map();
     for (const l of filtered) {
       const fullUrl = l.href.startsWith("http") ? l.href : `https://www.chrono24.fr${l.href}`;
@@ -213,6 +235,7 @@ async function scrapeListPage(pageUrl) {
         title: l.text && l.text.length > 3 ? l.text : `Listing ${id}`,
       });
     }
+
     return { expectedCount, items: [...byId.values()] };
   } finally {
     await context.close().catch(() => {});
@@ -222,12 +245,16 @@ async function scrapeListPage(pageUrl) {
 async function scrapeList(url, pageSize, maxPages) {
   const url1 = withParams(url, { pageSize, page: 1 });
   const first = await scrapeListPage(url1);
+
   const expectedCount = first.expectedCount;
   const computedTotalPages =
     typeof expectedCount === "number" && expectedCount > 0 ? Math.ceil(expectedCount / pageSize) : 1;
+
   const totalPagesToScrape = Math.min(maxPages, computedTotalPages);
+
   const all = new Map(first.items.map((x) => [x.id, x]));
   let pagesScraped = 1;
+
   for (let p = 2; p <= totalPagesToScrape; p++) {
     const pageUrl = withParams(url, { pageSize, page: p });
     const next = await scrapeListPage(pageUrl);
@@ -235,6 +262,7 @@ async function scrapeList(url, pageSize, maxPages) {
     pagesScraped = p;
     await sleep(randInt(700, 1400));
   }
+
   return {
     scrapedAt: new Date().toISOString(),
     expectedCount,
@@ -249,13 +277,14 @@ async function scrapeList(url, pageSize, maxPages) {
   };
 }
 
-// Scraping prix robuste avec priceSource
+// -------------------- Price scraping (detail page) --------------------
 async function scrapePriceForListing(listingUrl) {
   const br = await getBrowser(false);
   const { context, page } = await createPage(br, true);
+
   try {
     console.log("[PRICE] goto", listingUrl);
-    await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.detailGotoTimeoutMs });
     await acceptCookies(page);
     await simulateHuman(page);
 
@@ -265,15 +294,15 @@ async function scrapePriceForListing(listingUrl) {
         const scripts = document.querySelectorAll('script[type="application/ld+json"]');
         for (const script of scripts) {
           const data = JSON.parse(script.textContent || "{}");
-          if (data.offers?.price) {
+          if (data?.offers?.price) {
             return {
-              price: parseInt(data.offers.price.toString().replace(/[^0-9]/g, ""), 10),
+              price: parseInt(String(data.offers.price).replace(/[^0-9]/g, ""), 10),
               priceSource: "jsonld",
             };
           }
-          if (data["@type"] === "Product" && Array.isArray(data.offers) && data.offers[0]?.price) {
+          if (data?.["@type"] === "Product" && Array.isArray(data?.offers) && data.offers[0]?.price) {
             return {
-              price: parseInt(data.offers[0].price.toString().replace(/[^0-9]/g, ""), 10),
+              price: parseInt(String(data.offers[0].price).replace(/[^0-9]/g, ""), 10),
               priceSource: "jsonld",
             };
           }
@@ -311,7 +340,7 @@ async function scrapePriceForListing(listingUrl) {
         const el = document.querySelector(sel);
         if (el) {
           const raw = el.getAttribute("data-price") || el.textContent || "";
-          const cleaned = raw.replace(/[^0-9]/g, "");
+          const cleaned = String(raw).replace(/[^0-9]/g, "");
           if (cleaned) {
             return {
               price: parseInt(cleaned, 10),
@@ -322,7 +351,6 @@ async function scrapePriceForListing(listingUrl) {
       }
       return null;
     });
-
     if (fallbackResult && fallbackResult.price) return fallbackResult;
 
     return { price: null, priceSource: "none" };
@@ -334,7 +362,7 @@ async function scrapePriceForListing(listingUrl) {
   }
 }
 
-// ROUTES
+// -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("ok"));
 
 app.get("/health", async (req, res) => {
@@ -355,9 +383,10 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// Scrape avec job async
+// Scrape with async job
 app.post("/api/scrape", async (req, res) => {
   console.log("[HIT] /api/scrape", new Date().toISOString(), req.body);
+
   try {
     const { url, pageSize = 30, maxPages = 1, noCache = false, withPrices = false } = req.body || {};
     if (!url || typeof url !== "string" || !url.includes("chrono24")) {
@@ -373,15 +402,13 @@ app.post("/api/scrape", async (req, res) => {
     const listOut = await scrapeList(url, Number(pageSize), Number(maxPages));
 
     if (!withPrices) {
-      const response = {
-        ...listOut,
-        message: `${listOut.count} annonces récupérées`,
-      };
+      const response = { ...listOut, message: `${listOut.count} annonces récupérées` };
       cacheSet(key, response);
       return res.json(response);
     }
 
     const jobId = `job:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
+
     await redis.set(
       jobId,
       JSON.stringify({
@@ -393,7 +420,7 @@ app.post("/api/scrape", async (req, res) => {
       { ex: 3600 }
     );
 
-    // Background worker avec concurrence et updates légers
+    // Background worker (async)
     (async () => {
       const CONCURRENCY = 3;
       const results = [];
@@ -424,7 +451,6 @@ app.post("/api/scrape", async (req, res) => {
           { ex: 3600 }
         );
 
-        // petit sleep entre batches (pas par item)
         await sleep(randInt(100, 250));
       }
 
@@ -439,9 +465,9 @@ app.post("/api/scrape", async (req, res) => {
         }),
         { ex: 3600 }
       );
-    })().catch((err) => {
+    })().catch(async (err) => {
       console.error("[JOB ERROR]", jobId, err);
-      redis.set(
+      await redis.set(
         jobId,
         JSON.stringify({
           status: "failed",
@@ -461,9 +487,10 @@ app.post("/api/scrape", async (req, res) => {
       resultsUrl: `/api/jobs/${jobId}/results`,
     };
 
-    res.json(response);
+    cacheSet(key, response);
+    return res.json(response);
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
@@ -472,11 +499,11 @@ app.get("/api/jobs/:jobId/status", async (req, res) => {
     const { jobId } = req.params;
     const data = await redis.get(jobId);
 
-    if (!data) {
-      return res.status(404).json({ error: "Job non trouvé" });
-    }
+    if (!data) return res.status(404).json({ error: "Job non trouvé" });
 
-    const job = JSON.parse(data);
+    const job = safeJsonParse(data);
+    if (!job) return res.status(500).json({ error: "Invalid job data in Redis" });
+
     res.json({
       jobId,
       status: job.status,
@@ -495,11 +522,10 @@ app.get("/api/jobs/:jobId/results", async (req, res) => {
     const { jobId } = req.params;
     const data = await redis.get(jobId);
 
-    if (!data) {
-      return res.status(404).json({ error: "Job non trouvé" });
-    }
+    if (!data) return res.status(404).json({ error: "Job non trouvé" });
 
-    const job = JSON.parse(data);
+    const job = safeJsonParse(data);
+    if (!job) return res.status(500).json({ error: "Invalid job data in Redis" });
 
     if (job.status !== "completed") {
       return res.json({
@@ -512,8 +538,8 @@ app.get("/api/jobs/:jobId/results", async (req, res) => {
     res.json({
       status: "completed",
       jobId,
-      count: job.results.length,
-      prices: job.results,
+      count: Array.isArray(job.results) ? job.results.length : 0,
+      prices: Array.isArray(job.results) ? job.results : [],
       completedAt: job.completedAt,
     });
   } catch (e) {
@@ -521,7 +547,7 @@ app.get("/api/jobs/:jobId/results", async (req, res) => {
   }
 });
 
-// Ancien endpoint (compat)
+// Compatibility endpoint (list only)
 app.post("/api/scrape-list", async (req, res) => {
   console.log("[HIT] /api/scrape-list", new Date().toISOString(), req.body);
   try {
